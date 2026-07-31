@@ -1,6 +1,6 @@
 {
   "name": "pi-bg-watch",
-  "version": "1.0.0",
+  "version": "0.1.1",
   "description": "Background task lifecycle manager for pi coding agent — watch, status, output, cancel, kill, list",
   "keywords": ["pi-package", "pi-extension", "background", "process", "watcher"],
   "type": "module",
