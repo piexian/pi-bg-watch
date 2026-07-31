@@ -1,17 +1,20 @@
 /**
- * bg-watch — Background task lifecycle manager for pi coding agent
+ * bg-watch — 后台任务生命周期管理
  *
- * Registers the `bg_watch` tool and `/bg-watch` command.
- * Actions: watch | list | status | output | cancel | kill
+ * 注册 `bg_watch` 工具和 `/bg-watch` 命令。功能：
+ *   - watch：给一个已在后台运行的 PID 挂上完成通知（一次性哨兵）
+ *   - list：列出所有监控中的任务及状态
+ *   - status：查询单个任务的详细状态（进程存活、运行时长、watcher 健康）
+ *   - output：按需读取日志文件尾部（不必等完成）
+ *   - cancel：取消监控（停止 watcher、清理状态），目标进程不受影响
+ *   - kill：终止目标进程（SIGTERM → 等待 → SIGKILL），同时清理监控
  *
- * Architecture: spawns a detached watcher subprocess that polls target PID
- * liveness via kill(pid, 0). On exit, the watcher writes a .done.json state
- * file; the extension's interval checker consumes it and injects a completion
- * message into the session via pi.sendMessage (triggerTurn + nextTurn).
- * Watcher PID is recorded in state for precise cleanup on cancel/kill.
+ * 设计借鉴：grok-build 的 task_id + get_output + kill 三件套，
+ * claude-code 的 BashOutput/KillBash 分离模式。
  *
- * Design inspired by grok-build (task_id + get_output + kill) and
- * Claude Code (BashOutput / KillBash separation).
+ * 原理：spawn detached watcher 子进程轮询目标 PID 存活状态，
+ * 目标退出后写 done 文件；扩展用 setInterval 消费 done 文件并回调。
+ * watcher PID 记录在状态文件中，cancel/kill 时可精确清理。
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -21,12 +24,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const STATE_DIR = join(homedir(), ".pi", "agent", "bg-watch");
-const WATCH_INTERVAL_MS = 3_000; // watcher poll interval
-const CHECK_INTERVAL_MS = 2_000; // extension done-file consume interval
-const MAX_WATCH_MS = 12 * 60 * 60 * 1000; // 12h safety timeout
-const KILL_GRACE_MS = 5_000; // grace period after SIGTERM before SIGKILL
+const WATCH_INTERVAL_MS = 3_000; // watcher 轮询间隔
+const CHECK_INTERVAL_MS = 2_000; // 扩展消费 done 文件间隔
+const MAX_WATCH_MS = 12 * 60 * 60 * 1000; // 12h 兜底超时
+const KILL_GRACE_MS = 5_000; // SIGTERM 后等待退出的宽限期
 
-// ─── Data Structures ───────────────────────────────────────────────
+// ─── 数据结构 ───────────────────────────────────────────────
 
 type WatchRecord = {
 	pid: number;
@@ -34,17 +37,17 @@ type WatchRecord = {
 	logFile?: string;
 	quiet?: boolean;
 	startedAt: number;
-	watcherPid?: number; // watcher subprocess PID, for cleanup on cancel
-	command?: string; // optional: original command description
+	watcherPid?: number; // watcher 子进程 PID，用于 cancel 时清理
+	command?: string; // 可选：原始命令描述
 };
 
 type DoneRecord = WatchRecord & {
 	exitCode: number | null;
 	finishedAt: number;
-	timedOut?: boolean; // whether exited due to timeout
+	timedOut?: boolean; // 是否因超时退出
 };
 
-// ─── Path Helpers ───────────────────────────────────────────────
+// ─── 路径工具 ───────────────────────────────────────────────
 
 function statePath(pid: number): string {
 	return join(STATE_DIR, `${pid}.json`);
@@ -58,7 +61,7 @@ function ensureDir(): void {
 	mkdirSync(STATE_DIR, { recursive: true });
 }
 
-// ─── Process Helpers ───────────────────────────────────────────────
+// ─── 进程工具 ───────────────────────────────────────────────
 
 function isAlive(pid: number): boolean {
 	try {
@@ -78,7 +81,7 @@ function killPid(pid: number, signal: NodeJS.Signals = "SIGTERM"): boolean {
 	}
 }
 
-// ─── Detached Watcher Source ──────────────────────────────────
+// ─── detached watcher 源码 ──────────────────────────────────
 
 const WATCHER_SOURCE = `
 const fs = require("node:fs");
@@ -104,14 +107,14 @@ const timer = setInterval(() => {
 }, intervalMs);
 `;
 
-// ─── Main Extension ─────────────────────────────────────────────────
+// ─── 主扩展 ─────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	ensureDir();
 	let checkTimer: ReturnType<typeof setInterval> | null = null;
 	let uiRef: { setStatus: (key: string, text: string | undefined) => void; setWidget: (key: string, content: string[] | undefined, options?: { placement?: string }) => void; theme?: any } | null = null;
 
-	// ── TUI Display ──
+	// ── TUI 显示 ──
 
 	function refreshUI(): void {
 		if (!uiRef) return;
@@ -121,11 +124,11 @@ export default function (pi: ExtensionAPI) {
 			uiRef.setWidget("bg-watch", undefined);
 			return;
 		}
-		// footer status bar: brief indicator
+		// footer 状态栏：简短指示
 		const running = active.filter((r) => isAlive(r.pid)).length;
 		const statusText = `◎ ${running} bg task${running > 1 ? "s" : ""} running`;
 		uiRef.setStatus("bg-watch", statusText);
-		// widget: detailed list (above editor)
+		// widget：详细列表（编辑器上方）
 		const widgetLines = active.map((r) => {
 			const alive = isAlive(r.pid);
 			const elapsed = formatDuration(Date.now() - r.startedAt);
@@ -135,7 +138,7 @@ export default function (pi: ExtensionAPI) {
 		uiRef.setWidget("bg-watch", ["◎ bg-watch", ...widgetLines]);
 	}
 
-	// ── Internal Methods ──
+	// ── 内部方法 ──
 
 	function startWatcher(record: WatchRecord): number {
 		ensureDir();
@@ -145,19 +148,19 @@ export default function (pi: ExtensionAPI) {
 			{ detached: true, stdio: "ignore" },
 		);
 		watcher.unref();
-		// record watcher PID for cleanup on cancel
+		// 记录 watcher PID 以便 cancel 时清理
 		record.watcherPid = watcher.pid;
 		writeFileSync(statePath(record.pid), JSON.stringify(record));
 		return watcher.pid ?? -1;
 	}
 
 	function removeWatch(pid: number): void {
-		// load record to get watcherPid
+		// 读取记录获取 watcherPid
 		const rec = loadRecord(pid);
 		if (rec?.watcherPid && isAlive(rec.watcherPid)) {
 			killPid(rec.watcherPid, "SIGKILL");
 		}
-		// clean up state file
+		// 清理状态文件
 		try { unlinkSync(statePath(pid)); } catch { /* 不存在则忽略 */ }
 	}
 
@@ -211,7 +214,7 @@ export default function (pi: ExtensionAPI) {
 			`2. 确认产出：git status / 检查目标文件`,
 			`3. 如需重新运行：启动新进程后再次 bg_watch`,
 		];
-		// attach log tail on completion
+		// 完成时自动附带日志尾部
 		if (done.logFile && existsSync(done.logFile)) {
 			try {
 				const content = readFileSync(done.logFile, "utf8");
@@ -224,7 +227,7 @@ export default function (pi: ExtensionAPI) {
 			content: lines.join("\n"),
 			display: true,
 			details: { pid: done.pid, label: done.label, exitCode: done.exitCode, timedOut: done.timedOut },
-		}, { triggerTurn: true, deliverAs: "nextTurn" });
+		}, { triggerTurn: true, deliverAs: "followUp" });
 	}
 
 	function startChecker(): void {
@@ -233,13 +236,13 @@ export default function (pi: ExtensionAPI) {
 			for (const done of consumeDone()) {
 				if (!done.quiet) notifyDone(done);
 			}
-			// refresh TUI display
+			// 刷新 TUI 显示
 			refreshUI();
-			// stop timer when no active watches
+			// 没有活跃监控时停掉定时器省资源
 			if (listActive().length === 0 && checkTimer) {
 				clearInterval(checkTimer);
 				checkTimer = null;
-				refreshUI(); // clear widget/status
+				refreshUI(); // 清空 widget/status
 			}
 		}, CHECK_INTERVAL_MS);
 		checkTimer.unref?.();
@@ -262,7 +265,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// ── Register Tool ──
+	// ── 注册工具 ──
 
 	pi.registerTool({
 		name: "bg_watch",
@@ -314,7 +317,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `监控中的后台任务（${active.length}）：\n${lines.join("\n")}\n\n● 运行中 ○ 已退出` }] };
 			}
 
-			// all actions below require pid
+			// 以下 action 都需要 pid
 			if (!params.pid) {
 				return { content: [{ type: "text", text: `bg_watch ${action}: 需要 pid 参数。` }], isError: true };
 			}
@@ -325,19 +328,19 @@ export default function (pi: ExtensionAPI) {
 				if (!params.label) {
 					return { content: [{ type: "text", text: "bg_watch watch: label 必填。" }], isError: true };
 				}
-				// check if already watched
+				// 检查是否已在监控
 				const existing = loadRecord(pid);
 				if (existing) {
-					// watcher dead but state file remains → auto-cleanup and allow re-watch
+					// watcher 已死但状态文件残留 → 自动清理后允许重新挂
 					const watcherAlive = existing.watcherPid ? isAlive(existing.watcherPid) : false;
 					if (watcherAlive) {
 						return { content: [{ type: "text", text: `PID ${pid} 已在监控中（watcher ${existing.watcherPid} 存活）。如需重新挂，先 cancel 再 watch。` }], isError: true };
 					}
-					// watcher dead, clean stale state
+					// watcher 已死，清理残留状态
 					removeWatch(pid);
 				}
 				if (!isAlive(pid)) {
-					// process exited: check for unconsumed done file, deliver notification immediately
+					// 进程已退出：检查是否有未消费的 done 文件，有则立即投递通知
 					const dp = donePath(pid);
 					if (existsSync(dp)) {
 						try {
@@ -371,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 			if (action === "status") {
 				const rec = loadRecord(pid);
 				if (!rec) {
-					// may have completed, check done file
+					// 可能已完成，检查 done 文件
 					if (existsSync(donePath(pid))) {
 						return { content: [{ type: "text", text: `PID ${pid} 已完成但通知尚未消费，等待下一轮 checker 处理。` }] };
 					}
@@ -428,13 +431,13 @@ export default function (pi: ExtensionAPI) {
 			if (action === "kill") {
 				const rec = loadRecord(pid);
 				if (!isAlive(pid)) {
-					// process dead, clean up watch
+					// 进程已死，清理监控
 					if (rec) removeWatch(pid);
 					return { content: [{ type: "text", text: `PID ${pid} 已不存在，无需终止。${rec ? "已清理监控状态。" : ""}` }] };
 				}
 				// SIGTERM
 				killPid(pid, "SIGTERM");
-				// wait grace period
+				// 等待宽限期
 				const deadline = Date.now() + KILL_GRACE_MS;
 				let exited = false;
 				while (Date.now() < deadline) {
@@ -446,7 +449,7 @@ export default function (pi: ExtensionAPI) {
 					killPid(pid, "SIGKILL");
 					await new Promise((r) => setTimeout(r, 300));
 				}
-				// clean up watch
+				// 清理监控
 				if (rec) removeWatch(pid);
 				refreshUI();
 				const finalAlive = isAlive(pid);
@@ -461,7 +464,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Register Command ──
+	// ── 注册命令 ──
 
 	pi.registerCommand("bg-watch", {
 		description: "后台任务管理 (bg-watch [watch|list|status|cancel|kill] [pid] [label])",
@@ -480,7 +483,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// legacy compat: /bg-watch <pid> [label]
+			// 兼容旧用法: /bg-watch <pid> [label]
 			const firstAsPid = Number(sub);
 			if (Number.isInteger(firstAsPid) && firstAsPid > 0) {
 				const pid = firstAsPid;
@@ -500,7 +503,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// subcommands: watch/status/cancel/kill <pid>
+			// 子命令: watch/status/cancel/kill <pid>
 			const pid = Number(parts[1]);
 			if (!Number.isInteger(pid) || pid <= 0) {
 				ctx.ui.notify("用法: /bg-watch <watch|list|status|cancel|kill> <pid> [label]", "warning");
@@ -558,10 +561,10 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Session Start Recovery ──
+	// ── 会话启动恢复 ──
 
 	pi.on("session_start", async (_event, ctx) => {
-		// capture UI ref for widget/status updates
+		// 捕获 UI 引用用于 widget/status 更新
 		if (ctx.hasUI) {
 			uiRef = {
 				setStatus: (key, text) => ctx.ui.setStatus(key, text),
