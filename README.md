@@ -1,55 +1,57 @@
 # pi-bg-watch
 
-Background task lifecycle manager for [pi](https://pi.dev) coding agent.
+[English](./README_EN.md) | 中文
 
-Watches background processes and automatically notifies the session when they exit — no polling needed. Inspired by grok-build's task management and Claude Code's BashOutput/KillBash pattern.
+pi 编码代理的后台任务生命周期管理扩展。
 
-## Features
+监控后台进程，进程退出时自动通知会话——无需轮询。设计借鉴 grok-build 的任务管理和 Claude Code 的 BashOutput/KillBash 模式。
 
-| Action | Description |
-|--------|-------------|
-| `watch` | Attach a completion watcher to a running background PID |
-| `list` | Show all watched tasks with live status |
-| `status` | Detailed info: process alive, elapsed time, watcher health |
-| `output` | Read log file tail on demand (no need to wait for completion) |
-| `cancel` | Stop monitoring (target process keeps running) |
-| `kill` | Terminate target process (SIGTERM → grace period → SIGKILL) |
+## 功能
 
-**TUI integration**: Shows a footer status line (`◎ 2 bg tasks running`) and a widget above the editor listing active tasks with elapsed time.
+| Action | 说明 |
+|--------|------|
+| `watch` | 给一个正在运行的后台 PID 挂上完成通知 |
+| `list` | 列出所有监控中的任务及实时状态 |
+| `status` | 详细信息：进程存活、运行时长、watcher 健康状态 |
+| `output` | 按需读取日志文件尾部（不必等完成） |
+| `cancel` | 取消监控（目标进程继续运行） |
+| `kill` | 终止目标进程（SIGTERM → 宽限期 → SIGKILL） |
 
-**Auto-recovery**: If the watcher dies (crash/restart) or the process exits while the session is interrupted, re-watching the same PID auto-cleans stale state and delivers any missed completion notification.
+**TUI 集成**：底部状态栏显示 `◎ 2 bg tasks running`，编辑器上方 widget 列出活跃任务及运行时长。
 
-## Install
+**自动恢复**：如果 watcher 异常退出（崩溃/重启）或进程在会话中断期间结束，重新 watch 同一 PID 时会自动清理残留状态并补发遗漏的完成通知。
 
-```bash
-pi install git:github.com/earendil-works/pi-bg-watch
-```
-
-Or clone locally and add to settings:
+## 安装
 
 ```bash
-git clone https://github.com/earendil-works/pi-bg-watch ~/.pi/agent/extensions/pi-bg-watch
+pi install git:github.com/piexian/pi-bg-watch
 ```
 
-## Usage
+或克隆到本地后添加到 settings：
 
-### As a tool (called by the agent)
+```bash
+git clone https://github.com/piexian/pi-bg-watch ~/.pi/agent/extensions/pi-bg-watch
+```
+
+## 用法
+
+### 工具调用（由 agent 自动使用）
 
 ```
-# After launching a background process:
+# 启动后台进程后挂监控：
 bg_watch({ action: "watch", pid: 12345, label: "npm build", log_file: "/tmp/build.log" })
 
-# Check progress (only when user asks):
+# 查看进度（仅在用户主动要求时）：
 bg_watch({ action: "output", pid: 12345 })
 
-# Cancel monitoring:
+# 取消监控：
 bg_watch({ action: "cancel", pid: 12345 })
 
-# Kill the process:
+# 终止进程：
 bg_watch({ action: "kill", pid: 12345 })
 ```
 
-### As a slash command
+### 斜杠命令
 
 ```
 /bg-watch list
@@ -57,27 +59,27 @@ bg_watch({ action: "kill", pid: 12345 })
 /bg-watch status 12345
 /bg-watch cancel 12345
 /bg-watch kill 12345
-/bg-watch 12345 my task        # shorthand (legacy compat)
+/bg-watch 12345 my task        # 简写（兼容旧用法）
 ```
 
-## How It Works
+## 工作原理
 
-1. `watch` spawns a **detached watcher subprocess** that polls `/proc/<pid>` (via `kill(pid, 0)`) every 3s
-2. When the target exits, the watcher writes a `.done.json` state file and self-destructs
-3. The extension's checker (2s interval) consumes done files and injects a completion message via `pi.sendMessage({ triggerTurn: true, deliverAs: "nextTurn" })`
-4. The agent receives the notification as a system message and can act on it — no user input needed
+1. `watch` 生成一个 **detached watcher 子进程**，每 3s 通过 `kill(pid, 0)` 轮询目标 PID 存活状态
+2. 目标退出后，watcher 写入 `.done.json` 状态文件并自毁
+3. 扩展的 checker（2s 间隔）消费 done 文件，通过 `pi.sendMessage({ triggerTurn: true, deliverAs: "nextTurn" })` 注入完成消息
+4. Agent 收到系统消息后自动处理——无需用户输入
 
-State files live in `~/.pi/agent/bg-watch/`.
+状态文件存放在 `~/.pi/agent/bg-watch/`。
 
-## Anti-Polling Design
+## 防轮询设计
 
-The tool description and prompt guidelines explicitly instruct the agent to **never poll** after attaching a watcher. The completion notification is pushed automatically. This saves tokens and avoids blocking the conversation.
+工具描述和 prompt guidelines 明确指示 agent 在挂上监控后**禁止轮询**。完成通知由系统自动推送，节省 token 且不阻塞对话。
 
-## Requirements
+## 环境要求
 
-- pi coding agent (any recent version)
-- Linux or macOS (uses `process.kill(pid, 0)` for liveness checks)
+- pi coding agent（任意近期版本）
+- Linux 或 macOS（使用 `process.kill(pid, 0)` 检测存活）
 
-## License
+## 许可证
 
 MIT
