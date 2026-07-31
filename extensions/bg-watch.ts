@@ -263,13 +263,15 @@ export default function (pi: ExtensionAPI) {
 				lines.push("", `日志尾部（${done.logFile}）：`, "```", tail, "```");
 			} catch { /* skip if unreadable */ }
 		}
-		// steer: queued for next LLM call, does NOT trigger a new turn
+		// steer + triggerTurn: if agent is actively working (goal/streaming), the message
+		// queues and is delivered before the next LLM call (no interruption); if agent is
+		// idle, triggerTurn fires a new turn so the notification gets processed.
 		pi.sendMessage({
 			customType: "bg-watch-done",
 			content: lines.join("\n"),
 			display: true,
 			details: { pid: done.pid, label: done.label, exitCode: done.exitCode, timedOut: done.timedOut },
-		}, { deliverAs: "steer" });
+		}, { deliverAs: "steer", triggerTurn: true });
 	}
 
 	function startChecker(): void {
