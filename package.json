@@ -1,0 +1,20 @@
+{
+  "name": "pi-bg-watch",
+  "version": "1.0.0",
+  "description": "Background task lifecycle manager for pi coding agent — watch, status, output, cancel, kill, list",
+  "keywords": ["pi-package", "pi-extension", "background", "process", "watcher"],
+  "type": "module",
+  "license": "MIT",
+  "author": "Earendil",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/earendil-works/pi-bg-watch.git"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
