@@ -17,7 +17,13 @@ Watches background processes and automatically notifies the session when they ex
 | `cancel` | Stop monitoring (target process keeps running) |
 | `kill` | Terminate target process (SIGTERM → grace period → SIGKILL) |
 
-**TUI integration**: Shows a footer status line (`◎ 2 bg tasks running`) and a widget above the editor listing active tasks with elapsed time.
+**TUI integration**: Static footer status line (`● 2 bg tasks running`); the widget above the editor uses a theme-accent animation and lists active tasks with elapsed time (up to 12 lines); `Ctrl+Shift+B` toggles a per-task log summary (up to 3 lines), `Ctrl+Shift+PgUp/PgDn` scrolls.
+
+**Log panel**: `/bg-watch logs <pid>` opens a panel with `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scrolling; scrolling up pauses follow and `End` resumes; `Esc`/`q` closes. Title and hints stay fixed; content refreshes every second.
+
+**Bounded reads**: log tails read at most 32 KiB; `output` returns 30 lines by default (max 1000), the panel up to 80 lines, completion summaries up to 20 lines; control characters are stripped and overlong single lines are marked truncated.
+
+**Non-TUI**: RPC keeps a string widget of up to 12 lines; print/json show no UI — use `bg_watch output` only when asked.
 
 **Auto-recovery**: If the watcher dies (crash/restart) or the process exits while the session is interrupted, re-watching the same PID auto-cleans stale state and delivers any missed completion notification.
 
@@ -57,6 +63,7 @@ bg_watch({ action: "kill", pid: 12345 })
 /bg-watch list
 /bg-watch watch 12345 my build task
 /bg-watch status 12345
+/bg-watch logs 12345
 /bg-watch cancel 12345
 /bg-watch kill 12345
 /bg-watch 12345 my task        # shorthand (legacy compat)
@@ -66,7 +73,7 @@ bg_watch({ action: "kill", pid: 12345 })
 
 1. `watch` spawns a **detached watcher subprocess** that polls `/proc/<pid>` (via `kill(pid, 0)`) every 3s
 2. When the target exits, the watcher writes a `.done.json` state file and self-destructs
-3. The extension's checker (2s interval) consumes done files and injects a completion message via `pi.sendMessage({ triggerTurn: true, deliverAs: "nextTurn" })`
+3. The extension's checker (2s interval) consumes done files and injects a completion message via `pi.sendMessage(msg, { deliverAs: "steer", triggerTurn: true })`
 4. The agent receives the notification as a system message and can act on it — no user input needed
 
 State files live in `~/.pi/agent/bg-watch/`.
@@ -77,7 +84,7 @@ The tool description and prompt guidelines explicitly instruct the agent to **ne
 
 ## Requirements
 
-- pi coding agent (any recent version)
+- pi coding agent / pi-tui >= 1.5.0
 - Linux or macOS (uses `process.kill(pid, 0)` for liveness checks)
 
 ## License

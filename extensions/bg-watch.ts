@@ -7,7 +7,7 @@
  * Architecture: spawns a detached watcher subprocess that polls target PID
  * liveness via kill(pid, 0). On exit, the watcher writes a .done.json state
  * file; the extension's interval checker consumes it and injects a completion
- * message into the session via pi.sendMessage (steer, no triggerTurn).
+ * message into the session via pi.sendMessage (steer, triggerTurn).
  * Watcher PID is recorded in state for precise cleanup on cancel/kill.
  *
  * Session-scoped: each watch record carries a sessionId. Only records
@@ -17,10 +17,11 @@
  * Design inspired by grok-build (task_id + get_output + kill) and
  * Claude Code (BashOutput / KillBash separation).
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, replaceControlCharacters, ScrollView, stripTerminalSequences, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -29,6 +30,13 @@ const WATCH_INTERVAL_MS = 3_000; // watcher poll interval
 const CHECK_INTERVAL_MS = 2_000; // extension done-file consume interval
 const MAX_WATCH_MS = 12 * 60 * 60 * 1000; // 12h safety timeout
 const KILL_GRACE_MS = 5_000; // grace period after SIGTERM before SIGKILL
+const LOG_TAIL_BYTES = 32 * 1024;
+const LOG_TAIL_LINES = 80;
+const WIDGET_LOG_LINES = 3;
+const MAX_WIDGET_LINES = 12;
+const UI_SPINNER_INTERVAL_MS = 180;
+const LOG_PANEL_REFRESH_MS = 1_000;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ─── Data Structures ───────────────────────────────────────
 
@@ -115,31 +123,316 @@ export default function (pi: ExtensionAPI) {
 	ensureDir();
 	let checkTimer: ReturnType<typeof setInterval> | null = null;
 	let currentSessionId: string | undefined;
-	let uiRef: { setStatus: (key: string, text: string | undefined) => void; setWidget: (key: string, content: string[] | undefined, options?: { placement?: string }) => void; theme?: any } | null = null;
+	type UiRef = Pick<ExtensionContext["ui"], "setStatus" | "setWidget"> & { isTui: boolean };
+
+	// Bounded text viewport: composes Text+ScrollView, clips rendered output to a given height.
+	// Owner calls render() each frame with its allowed height; holds no timers.
+	class BoundedTextView {
+		private readonly text: Text;
+		private readonly scroller: ScrollView;
+
+		constructor() {
+			this.text = new Text();
+			this.scroller = new ScrollView(this.text, { follow: "end", scrollbar: "hidden" });
+		}
+
+		get isFollowingEnd(): boolean {
+			return this.scroller.isFollowingEnd;
+		}
+
+		render(lines: string[], width: number, height: number, requestRender: () => void): string[] {
+			const allowed = Math.max(1, height);
+			const display = lines.map((line) =>
+				truncateToWidth(replaceControlCharacters(stripTerminalSequences(line)), width),
+			);
+			this.text.setText(display.join("\n"));
+			this.scroller.updateLayout(display.length, allowed, requestRender);
+			return display.slice(this.scroller.scrollTop, this.scroller.scrollTop + allowed);
+		}
+
+		scrollBy(delta: number): void {
+			this.scroller.scrollBy(delta);
+		}
+
+		scrollToStart(): void {
+			this.scroller.scrollToStart();
+		}
+
+		scrollToEnd(): void {
+			this.scroller.scrollToEnd();
+		}
+
+		dispose(): void {
+			this.text.setText("");
+			this.scroller.updateLayout(0, 1, () => {});
+		}
+	}
+
+	class BackgroundTaskWidget {
+		private readonly tui: TUI;
+		private readonly theme: Theme;
+		private readonly view = new BoundedTextView();
+		private lines: string[] = [];
+		private frame = 0;
+		private bodyHeight = MAX_WIDGET_LINES - 1;
+		private timer: ReturnType<typeof setInterval> | null = null;
+		private disposed = false;
+
+		constructor(tui: TUI, theme: Theme, lines: string[]) {
+			this.tui = tui;
+			this.theme = theme;
+			this.setLines(lines);
+			this.timer = setInterval(() => {
+				if (this.disposed) return;
+				this.frame = (this.frame + 1) % SPINNER_FRAMES.length;
+				this.tui.requestRender();
+			}, UI_SPINNER_INTERVAL_MS);
+			this.timer.unref?.();
+		}
+
+		setLines(lines: string[]): void {
+			if (this.disposed) return;
+			this.lines = lines;
+			if (this.view.isFollowingEnd) this.view.scrollToEnd();
+			this.tui.requestRender();
+		}
+
+		render(width: number): string[] {
+			if (this.disposed) return [];
+			const [header = "bg-watch", ...body] = this.lines;
+			const icon = this.theme.fg("accent", SPINNER_FRAMES[this.frame]);
+			// Total rows cap: 12, or shrink to terminal height (title + body).
+			const maxTotal = Math.min(MAX_WIDGET_LINES, this.tui.terminal.rows - 1);
+			this.bodyHeight = Math.max(1, maxTotal - 1);
+			const clipped = this.view.render(body, width, this.bodyHeight, () => this.tui.requestRender());
+			return [truncateToWidth(`${icon} ${header}`, width), ...clipped];
+		}
+
+		invalidate(): void {}
+
+		scrollBy(delta: number): void {
+			if (this.disposed) return;
+			this.view.scrollBy(delta);
+			this.tui.requestRender();
+		}
+
+		scrollPage(direction: number): void {
+			this.scrollBy(direction * this.bodyHeight);
+		}
+
+		dispose(): void {
+			if (this.disposed) return;
+			this.disposed = true;
+			if (this.timer) clearInterval(this.timer);
+			this.timer = null;
+			this.view.dispose();
+		}
+	}
+
+	class LiveLogPanel {
+		readonly capturesViewportInput = true;
+		private readonly tui: TUI;
+		private readonly theme: Theme;
+		private readonly view = new BoundedTextView();
+		private readonly pid: number;
+		private readonly label: string;
+		private readonly logFile?: string;
+		private readonly closePanel: () => void;
+		private readonly done: (result: undefined) => void;
+		private content = "";
+		private bodyHeight = 1;
+		private timer: ReturnType<typeof setInterval> | null = null;
+		private closed = false;
+
+		constructor(
+			tui: TUI,
+			theme: Theme,
+			pid: number,
+			label: string,
+			logFile: string | undefined,
+			closePanel: () => void,
+			done: (result: undefined) => void,
+		) {
+			this.tui = tui;
+			this.theme = theme;
+			this.pid = pid;
+			this.label = label;
+			this.logFile = logFile;
+			this.closePanel = closePanel;
+			this.done = done;
+			this.refresh();
+			this.timer = setInterval(() => {
+				this.refresh();
+				this.tui.requestRender();
+			}, LOG_PANEL_REFRESH_MS);
+			this.timer.unref?.();
+		}
+
+		// Re-read tail at 1 Hz; empty / unreadable / unconfigured stay distinct.
+		private refresh(): void {
+			if (this.logFile === undefined) this.content = "日志不可用：未设置 log_file";
+			else {
+				const tail = readLogTail(this.logFile, LOG_TAIL_LINES, LOG_TAIL_BYTES);
+				this.content = tail === null ? "日志不可用" : tail === "" ? "日志为空" : tail;
+			}
+		}
+
+		render(width: number): string[] {
+			if (this.closed) return [];
+			const label = replaceControlCharacters(stripTerminalSequences(this.label));
+			const path = this.logFile ? replaceControlCharacters(stripTerminalSequences(this.logFile)) : "未设置日志";
+			const meta = this.theme.fg("muted", truncateToWidth(`${label} · ${path}`, width));
+			const hint = this.theme.fg("dim", truncateToWidth("↑↓ / PgUp PgDn / Home End · Esc 或 q 关闭", width));
+			// title + meta + hint + 1 spare row reserved from terminal height.
+			this.bodyHeight = Math.max(1, this.tui.terminal.rows - 4);
+			const body = this.view.render(this.content.split("\n"), width, this.bodyHeight, () => this.tui.requestRender());
+			return [
+				this.theme.fg("accent", truncateToWidth(`bg-watch logs · PID ${this.pid}`, width)),
+				meta,
+				...body,
+				hint,
+			];
+		}
+
+		invalidate(): void {}
+
+		handleInput(data: string): void {
+			if (this.closed) return;
+			if (matchesKey(data, "escape") || matchesKey(data, "q")) {
+				this.close();
+				return;
+			}
+			// Scroll only the body view; fixed title/meta/hint never move.
+			if (matchesKey(data, "up")) this.view.scrollBy(-1);
+			else if (matchesKey(data, "down")) this.view.scrollBy(1);
+			else if (matchesKey(data, "pageUp")) this.view.scrollBy(-this.bodyHeight);
+			else if (matchesKey(data, "pageDown")) this.view.scrollBy(this.bodyHeight);
+			else if (matchesKey(data, "home")) this.view.scrollToStart();
+			else if (matchesKey(data, "end")) this.view.scrollToEnd();
+			else return;
+			this.tui.requestRender();
+		}
+
+		// q/Esc/shutdown path: resolve custom command, then notify panel closed.
+		close(): void {
+			if (this.closed) return;
+			this.dispose();
+			this.done(undefined);
+			this.closePanel();
+		}
+
+		// Sole cleanup; idempotent for host dispose after done.
+		dispose(): void {
+			if (this.closed) return;
+			this.closed = true;
+			if (this.timer) clearInterval(this.timer);
+			this.timer = null;
+			this.view.dispose();
+		}
+	}
+
+	let uiRef: UiRef | null = null;
+	let widgetComponent: BackgroundTaskWidget | null = null;
+	let activeLogPanel: LiveLogPanel | null = null;
+	let widgetMountRequested = false;
+	let widgetExpanded = false;
+	let latestWidgetLines: string[] = [];
 
 	// ── TUI Display ──
+
+	function buildWidgetLines(active: WatchRecord[]): string[] {
+		const running = active.filter((record) => isAlive(record.pid)).length;
+		const lines = [`bg-watch · ${running}/${active.length} running · Ctrl+Shift+B ${widgetExpanded ? "折叠" : "展开"}`];
+		for (const record of active) {
+			const alive = isAlive(record.pid);
+			const label = truncateToWidth(replaceControlCharacters(stripTerminalSequences(record.label)), 80);
+			lines.push(`  ${alive ? "●" : "○"} PID ${record.pid}: ${label} (${formatDuration(Date.now() - record.startedAt)})${alive ? "" : " [exited]"}`);
+			if (!widgetExpanded) continue;
+			if (!record.logFile) {
+				lines.push("    log unavailable: no log_file");
+				continue;
+			}
+			const tail = readLogTail(record.logFile, WIDGET_LOG_LINES, LOG_TAIL_BYTES);
+			if (tail === null) {
+				lines.push(`    log unavailable: ${truncateToWidth(replaceControlCharacters(stripTerminalSequences(record.logFile)), 100)}`);
+				continue;
+			}
+			if (!tail) {
+				lines.push("    log empty");
+				continue;
+			}
+			for (const line of tail.split("\n").slice(-WIDGET_LOG_LINES)) {
+				lines.push(`    ${truncateToWidth(line, 140)}`);
+			}
+		}
+		return lines;
+	}
+
+	function disposeWidget(): void {
+		widgetComponent?.dispose();
+		widgetComponent = null;
+		widgetMountRequested = false;
+	}
 
 	function refreshUI(): void {
 		if (!uiRef) return;
 		const active = listActive();
 		if (active.length === 0) {
 			uiRef.setStatus("bg-watch", undefined);
+			disposeWidget();
+			latestWidgetLines = [];
 			uiRef.setWidget("bg-watch", undefined);
 			return;
 		}
-		// footer status bar: brief indicator
-		const running = active.filter((r) => isAlive(r.pid)).length;
-		const statusText = `◎ ${running} bg task${running > 1 ? "s" : ""} running`;
-		uiRef.setStatus("bg-watch", statusText);
-		// widget: detailed list (above editor)
-		const widgetLines = active.map((r) => {
-			const alive = isAlive(r.pid);
-			const elapsed = formatDuration(Date.now() - r.startedAt);
-			const icon = alive ? "●" : "○";
-			return `  ${icon} PID ${r.pid}: ${r.label} (${elapsed})${alive ? "" : " [exited]"}`;
-		});
-		uiRef.setWidget("bg-watch", ["◎ bg-watch", ...widgetLines]);
+
+		const running = active.filter((record) => isAlive(record.pid)).length;
+		uiRef.setStatus("bg-watch", `● ${running} bg task${running > 1 ? "s" : ""} running`);
+		latestWidgetLines = buildWidgetLines(active);
+		if (!uiRef.isTui) {
+			const capped = latestWidgetLines.length > MAX_WIDGET_LINES
+				? [...latestWidgetLines.slice(0, MAX_WIDGET_LINES - 1), `  … ${latestWidgetLines.length - MAX_WIDGET_LINES + 1} more lines`]
+				: latestWidgetLines;
+			uiRef.setWidget("bg-watch", capped, { placement: "aboveEditor" });
+			return;
+		}
+
+		if (!widgetMountRequested) {
+			widgetMountRequested = true;
+			uiRef.setWidget(
+				"bg-watch",
+				(tui, theme) => {
+					const component = new BackgroundTaskWidget(tui, theme, latestWidgetLines);
+					widgetComponent = component;
+					return component;
+				},
+				{ placement: "aboveEditor" },
+			);
+		}
+		widgetComponent?.setLines(latestWidgetLines);
 	}
+
+	pi.registerShortcut(Key.ctrlShift("b"), {
+		description: "Toggle bg-watch log summary",
+		handler: () => {
+			if (listActive().length === 0) return;
+			widgetExpanded = !widgetExpanded;
+			refreshUI();
+		},
+	});
+
+	pi.registerShortcut(Key.ctrlShift("pageUp"), {
+		description: "bg-watch: scroll widget summary up (向上滚动)",
+		handler: () => {
+			widgetComponent?.scrollPage(-1);
+		},
+	});
+
+	pi.registerShortcut(Key.ctrlShift("pageDown"), {
+		description: "bg-watch: scroll widget summary down (向下滚动)",
+		handler: () => {
+			widgetComponent?.scrollPage(1);
+		},
+	});
 
 	// ── Internal Methods ──
 
@@ -249,19 +542,20 @@ export default function (pi: ExtensionAPI) {
 				: `${duration}s`;
 		const reason = done.timedOut ? "（超时自动结束）" : "";
 		const lines = [
-			`[bg-watch] 后台任务已结束：${done.label}（PID ${done.pid}，运行 ${durationStr}）${reason}`,
+			`[bg-watch] 后台任务已结束：${replaceControlCharacters(stripTerminalSequences(done.label))}（PID ${done.pid}，运行 ${durationStr}）${reason}`,
 			`后续操作：`,
 			`1. 查看日志：bg_watch({ action: "output", pid: ${done.pid} })`,
 			`2. 确认产出：git status / 检查目标文件`,
 			`3. 如需重新运行：启动新进程后再次 bg_watch`,
 		];
-		// attach log tail on completion
-		if (done.logFile && existsSync(done.logFile)) {
-			try {
-				const content = readFileSync(done.logFile, "utf8");
-				const tail = content.trimEnd().split("\n").slice(-20).join("\n");
-				lines.push("", `日志尾部（${done.logFile}）：`, "```", tail, "```");
-			} catch { /* skip if unreadable */ }
+		// attach sanitized log tail on completion
+		const cleanPath = done.logFile ? replaceControlCharacters(stripTerminalSequences(done.logFile)) : "";
+		if (!done.logFile) lines.push("", "日志尾部不可用：未设置 log_file");
+		else {
+			const tail = readLogTail(done.logFile, 20, LOG_TAIL_BYTES);
+			if (tail === null) lines.push("", `日志尾部不可用：${cleanPath}`);
+			else if (tail === "") lines.push("", `日志为空：${cleanPath}`);
+			else lines.push("", `日志尾部（${cleanPath}）：`, "```", tail, "```");
 		}
 		// steer + triggerTurn: if agent is actively working (goal/streaming), the message
 		// queues and is delivered before the next LLM call (no interruption); if agent is
@@ -299,14 +593,66 @@ export default function (pi: ExtensionAPI) {
 		return `${s}s`;
 	}
 
-	function readLogTail(logFile: string, lines = 30): string | null {
-		if (!existsSync(logFile)) return null;
+	function readLogTail(logFile: string, lines = 30, maxBytes = LOG_TAIL_BYTES): string | null {
+		const lineLimit = Number.isFinite(lines) ? Math.min(1_000, Math.max(1, Math.floor(lines))) : 30;
+		const byteLimit = Number.isFinite(maxBytes) ? Math.min(LOG_TAIL_BYTES, Math.max(1, Math.floor(maxBytes))) : LOG_TAIL_BYTES;
+		const truncatedMark = "[truncated] ";
+		let fd: number | undefined;
 		try {
-			const content = readFileSync(logFile, "utf8");
-			return content.trimEnd().split("\n").slice(-lines).join("\n");
+			fd = openSync(logFile, "r");
+			const size = fstatSync(fd).size;
+			const start = Math.max(0, size - byteLimit);
+			const length = size - start;
+			const buffer = Buffer.alloc(length);
+			const bytesRead = length > 0 ? readSync(fd, buffer, 0, length, start) : 0;
+			if (bytesRead === 0) return "";
+			// Skip continuation bytes of a character split by the window start.
+			let decodeStart = 0;
+			if (start > 0) while (decodeStart < bytesRead && (buffer[decodeStart] & 0xc0) === 0x80) decodeStart++;
+			let content = buffer.toString("utf8", decodeStart, bytesRead).replace(/\r\n?/g, "\n");
+			if (start > 0) {
+				const newline = content.indexOf("\n");
+				if (newline < 0) content = `${truncatedMark}${content}`;
+				else if (newline === content.length - 1) content = `${truncatedMark}${content.slice(0, -1)}`;
+				// Drop the partial first line, then keep the last N whole lines.
+				else content = content.slice(newline + 1);
+			}
+			if (content.endsWith("\n")) content = content.slice(0, -1);
+			const cleaned = content
+				.split("\n")
+				.map((line) => replaceControlCharacters(stripTerminalSequences(line)).trimEnd());
+			return cleaned.slice(-lineLimit).join("\n");
 		} catch {
 			return null;
+		} finally {
+			if (fd !== undefined) closeSync(fd);
 		}
+	}
+
+	async function openLogPanel(pid: number, ctx: ExtensionContext): Promise<void> {
+		const record = loadRecord(pid);
+		if (!record) {
+			ctx.ui.notify(`PID ${pid} 不在监控列表中`, "warning");
+			return;
+		}
+		if (record.sessionId !== currentSessionId) {
+			ctx.ui.notify("日志面板仅限当前会话的监控记录。", "warning");
+			return;
+		}
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("日志面板仅在 TUI 模式可用；请使用 bg_watch output 查看一次日志。", "warning");
+			return;
+		}
+		await ctx.ui.custom<undefined>(
+			(tui, theme, _keybindings, done) => {
+				const panel = new LiveLogPanel(tui, theme, pid, record.label, record.logFile, () => {
+					activeLogPanel = null;
+				}, done);
+				activeLogPanel = panel;
+				return panel;
+			},
+			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%" } },
+		);
 	}
 
 	// ── Register Tool ──
@@ -350,7 +696,7 @@ export default function (pi: ExtensionAPI) {
 			if (action === "list") {
 				const active = listActive();
 				if (active.length === 0) {
-					return { content: [{ type: "text", text: "当前没有监控中的后台任务。" }] };
+					return { content: [{ type: "text", text: "当前没有监控中的后台任务。" }], details: undefined };
 				}
 				const lines = active.map((r) => {
 					const alive = isAlive(r.pid);
@@ -358,19 +704,19 @@ export default function (pi: ExtensionAPI) {
 					const cmd = r.command ? ` [${r.command}]` : "";
 					return `- PID ${r.pid}${alive ? " ●" : " ○"} ${r.label}${cmd}（${elapsed}）${alive ? "" : " ⚠️进程已退出但通知未消费"}`;
 				});
-				return { content: [{ type: "text", text: `监控中的后台任务（${active.length}）：\n${lines.join("\n")}\n\n● 运行中 ○ 已退出` }] };
+				return { content: [{ type: "text", text: `监控中的后台任务（${active.length}）：\n${lines.join("\n")}\n\n● 运行中 ○ 已退出` }], details: undefined };
 			}
 
 			// all actions below require pid
 			if (!params.pid) {
-				return { content: [{ type: "text", text: `bg_watch ${action}: 需要 pid 参数。` }], isError: true };
+				return { content: [{ type: "text", text: `bg_watch ${action}: 需要 pid 参数。` }], details: undefined, isError: true };
 			}
 			const pid = params.pid;
 
 			// ── watch ──
 			if (action === "watch") {
 				if (!params.label) {
-					return { content: [{ type: "text", text: "bg_watch watch: label 必填。" }], isError: true };
+					return { content: [{ type: "text", text: "bg_watch watch: label 必填。" }], details: undefined, isError: true };
 				}
 				// check if already watched
 				const existing = loadRecord(pid);
@@ -378,7 +724,7 @@ export default function (pi: ExtensionAPI) {
 					// watcher dead but state file remains → auto-cleanup and allow re-watch
 					const watcherAlive = existing.watcherPid ? isAlive(existing.watcherPid) : false;
 					if (watcherAlive) {
-						return { content: [{ type: "text", text: `PID ${pid} 已在监控中（watcher ${existing.watcherPid} 存活）。如需重新挂，先 cancel 再 watch。` }], isError: true };
+						return { content: [{ type: "text", text: `PID ${pid} 已在监控中（watcher ${existing.watcherPid} 存活）。如需重新挂，先 cancel 再 watch。` }], details: undefined, isError: true };
 					}
 					// watcher dead, clean stale state
 					removeWatch(pid);
@@ -393,9 +739,9 @@ export default function (pi: ExtensionAPI) {
 							if (!done.quiet) notifyDone(done);
 						} catch { /* corrupt file, just delete */ try { unlinkSync(dp); } catch {} }
 						refreshUI();
-						return { content: [{ type: "text", text: `PID ${pid} 已退出，完成通知已补发。无需重新挂监控。` }] };
+						return { content: [{ type: "text", text: `PID ${pid} 已退出，完成通知已补发。无需重新挂监控。` }], details: undefined };
 					}
-					return { content: [{ type: "text", text: `PID ${pid} 不存在或已退出，无法挂监控。` }], isError: true };
+					return { content: [{ type: "text", text: `PID ${pid} 不存在或已退出，无法挂监控。` }], details: undefined, isError: true };
 				}
 				const record: WatchRecord = {
 					pid,
@@ -421,9 +767,9 @@ export default function (pi: ExtensionAPI) {
 				if (!rec) {
 					// may have completed, check done file
 					if (existsSync(donePath(pid))) {
-						return { content: [{ type: "text", text: `PID ${pid} 已完成但通知尚未消费，等待下一轮 checker 处理。` }] };
+						return { content: [{ type: "text", text: `PID ${pid} 已完成但通知尚未消费，等待下一轮 checker 处理。` }], details: undefined };
 					}
-					return { content: [{ type: "text", text: `PID ${pid} 不在监控列表中。` }], isError: true };
+					return { content: [{ type: "text", text: `PID ${pid} 不在监控列表中。` }], details: undefined, isError: true };
 				}
 				const alive = isAlive(pid);
 				const watcherAlive = rec.watcherPid ? isAlive(rec.watcherPid) : false;
@@ -438,7 +784,7 @@ export default function (pi: ExtensionAPI) {
 				];
 				if (!alive) lines.push("⚠️ 目标进程已退出，完成通知即将触发。");
 				if (!watcherAlive && alive) lines.push("⚠️ Watcher 异常退出，完成通知可能丢失。建议 cancel 后重新 watch。");
-				return { content: [{ type: "text", text: lines.join("\n") }] };
+				return { content: [{ type: "text", text: lines.join("\n") }], details: undefined };
 			}
 
 			// ── output ──
@@ -446,15 +792,16 @@ export default function (pi: ExtensionAPI) {
 				const rec = loadRecord(pid);
 				const logFile = params.log_file ?? rec?.logFile;
 				if (!logFile) {
-					return { content: [{ type: "text", text: `PID ${pid} 未关联日志文件。请提供 log_file 参数。` }], isError: true };
+					return { content: [{ type: "text", text: `PID ${pid} 未关联日志文件。请提供 log_file 参数。` }], details: undefined, isError: true };
 				}
 				const tail = readLogTail(logFile, params.lines ?? 30);
 				if (tail === null) {
-					return { content: [{ type: "text", text: `日志文件不存在或不可读：${logFile}` }], isError: true };
+					return { content: [{ type: "text", text: `日志文件不存在或不可读：${logFile}` }], details: undefined, isError: true };
 				}
 				const alive = isAlive(pid);
 				return {
 					content: [{ type: "text", text: `[${alive ? "运行中" : "已退出"}] ${logFile} 尾部：\n\`\`\`\n${tail}\n\`\`\`` }],
+					details: undefined,
 				};
 			}
 
@@ -462,13 +809,14 @@ export default function (pi: ExtensionAPI) {
 			if (action === "cancel") {
 				const rec = loadRecord(pid);
 				if (!rec) {
-					return { content: [{ type: "text", text: `PID ${pid} 不在监控列表中，无需取消。` }] };
+					return { content: [{ type: "text", text: `PID ${pid} 不在监控列表中，无需取消。` }], details: undefined };
 				}
 				removeWatch(pid);
 				refreshUI();
 				const targetAlive = isAlive(pid);
 				return {
 					content: [{ type: "text", text: `已取消对 PID ${pid}（${rec.label}）的监控。${targetAlive ? "目标进程仍在运行。" : "目标进程已退出。"}\n如需重新挂监控：bg_watch({ action: "watch", pid: ${pid}, label: "..." })` }],
+					details: undefined,
 				};
 			}
 
@@ -478,7 +826,7 @@ export default function (pi: ExtensionAPI) {
 				if (!isAlive(pid)) {
 					// process dead, clean up watch
 					if (rec) removeWatch(pid);
-					return { content: [{ type: "text", text: `PID ${pid} 已不存在，无需终止。${rec ? "已清理监控状态。" : ""}` }] };
+					return { content: [{ type: "text", text: `PID ${pid} 已不存在，无需终止。${rec ? "已清理监控状态。" : ""}` }], details: undefined };
 				}
 				// SIGTERM
 				killPid(pid, "SIGTERM");
@@ -502,17 +850,18 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text", text: finalAlive
 						? `⚠️ PID ${pid} 未能终止（可能需要手动处理）。`
 						: `已终止 PID ${pid}${rec ? `（${rec.label}）` : ""}。${exited ? "（SIGTERM 生效）" : "（SIGKILL 强制终止）"}监控已清理。` }],
+					details: undefined,
 				};
 			}
 
-			return { content: [{ type: "text", text: `未知 action: ${action}` }], isError: true };
+			return { content: [{ type: "text", text: `未知 action: ${action}` }], details: undefined, isError: true };
 		},
 	});
 
 	// ── Register Command ──
 
 	pi.registerCommand("bg-watch", {
-		description: "后台任务管理 (bg-watch [watch|list|status|cancel|kill] [pid] [label])",
+		description: "后台任务管理 (bg-watch [watch|list|status|logs|cancel|kill] [pid] [label])",
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const sub = parts[0] ?? "list";
@@ -551,7 +900,12 @@ export default function (pi: ExtensionAPI) {
 			// subcommands: watch/status/cancel/kill <pid>
 			const pid = Number(parts[1]);
 			if (!Number.isInteger(pid) || pid <= 0) {
-				ctx.ui.notify("用法: /bg-watch <watch|list|status|cancel|kill> <pid> [label]", "warning");
+				ctx.ui.notify("用法: /bg-watch <watch|list|status|logs|cancel|kill> <pid> [label]", "warning");
+				return;
+			}
+
+			if (sub === "logs") {
+				await openLogPanel(pid, ctx);
 				return;
 			}
 
@@ -602,7 +956,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify(`未知子命令: ${sub}。可用: watch, list, status, cancel, kill`, "warning");
+			ctx.ui.notify(`未知子命令: ${sub}。可用: watch, list, status, logs, cancel, kill`, "warning");
 		},
 	});
 
@@ -612,12 +966,23 @@ export default function (pi: ExtensionAPI) {
 		// capture session ID for scoping
 		currentSessionId = ctx.sessionManager.getSessionId();
 
+		// release the previous session's UI component before rebinding the context
+		if (uiRef) {
+			uiRef.setStatus("bg-watch", undefined);
+			uiRef.setWidget("bg-watch", undefined);
+		}
+		disposeWidget();
+		activeLogPanel?.close();
+		activeLogPanel = null;
+		uiRef = null;
+		widgetExpanded = false;
+
 		// capture UI ref for widget/status updates
 		if (ctx.hasUI) {
 			uiRef = {
+				isTui: ctx.mode === "tui",
 				setStatus: (key, text) => ctx.ui.setStatus(key, text),
-				setWidget: (key, content, options) => ctx.ui.setWidget(key, content, options as any),
-				theme: (ctx.ui as any).theme,
+				setWidget: ctx.ui.setWidget.bind(ctx.ui),
 			};
 		}
 
@@ -631,5 +996,19 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (listActive().length > 0) startChecker();
 		refreshUI();
+	});
+
+	pi.on("session_shutdown", () => {
+		if (checkTimer) clearInterval(checkTimer);
+		checkTimer = null;
+		if (uiRef) {
+			uiRef.setStatus("bg-watch", undefined);
+			uiRef.setWidget("bg-watch", undefined);
+		}
+		disposeWidget();
+		activeLogPanel?.close();
+		activeLogPanel = null;
+		uiRef = null;
+		currentSessionId = undefined;
 	});
 }

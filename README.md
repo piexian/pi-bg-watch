@@ -17,7 +17,13 @@ pi 编码代理的后台任务生命周期管理扩展。
 | `cancel` | 取消监控（目标进程继续运行） |
 | `kill` | 终止目标进程（SIGTERM → 宽限期 → SIGKILL） |
 
-**TUI 集成**：底部状态栏显示 `◎ 2 bg tasks running`，编辑器上方 widget 列出活跃任务及运行时长。
+**TUI 集成**：底部状态栏静态显示 `● 2 bg tasks running`；编辑器上方 widget 使用主题 accent 动画，列出活跃任务及运行时长（最多 12 行）；`Ctrl+Shift+B` 折叠/展开每任务最多 3 行日志摘要，`Ctrl+Shift+PgUp/PgDn` 滚动。
+
+**日志面板**：`/bg-watch logs <pid>` 打开面板，`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 滚动，上滚暂停跟随、`End` 恢复，`Esc`/`q` 关闭；标题与提示固定，每秒刷新。
+
+**有界读取**：日志尾部最多读 32 KiB；`output` 默认 30 行、最多 1000 行，面板最多 80 行，完成摘要最多 20 行；清理控制字符，超长单行标记截断。
+
+**非 TUI**：RPC 模式保留最多 12 行的字符串 widget；print/json 模式无 UI，仅在用户要求时用 `bg_watch output` 查看日志。
 
 **自动恢复**：如果 watcher 异常退出（崩溃/重启）或进程在会话中断期间结束，重新 watch 同一 PID 时会自动清理残留状态并补发遗漏的完成通知。
 
@@ -57,6 +63,7 @@ bg_watch({ action: "kill", pid: 12345 })
 /bg-watch list
 /bg-watch watch 12345 my build task
 /bg-watch status 12345
+/bg-watch logs 12345
 /bg-watch cancel 12345
 /bg-watch kill 12345
 /bg-watch 12345 my task        # 简写（兼容旧用法）
@@ -66,7 +73,7 @@ bg_watch({ action: "kill", pid: 12345 })
 
 1. `watch` 生成一个 **detached watcher 子进程**，每 3s 通过 `kill(pid, 0)` 轮询目标 PID 存活状态
 2. 目标退出后，watcher 写入 `.done.json` 状态文件并自毁
-3. 扩展的 checker（2s 间隔）消费 done 文件，通过 `pi.sendMessage({ triggerTurn: true, deliverAs: "nextTurn" })` 注入完成消息
+3. 扩展的 checker（2s 间隔）消费 done 文件，通过 `pi.sendMessage(msg, { deliverAs: "steer", triggerTurn: true })` 注入完成消息
 4. Agent 收到系统消息后自动处理——无需用户输入
 
 状态文件存放在 `~/.pi/agent/bg-watch/`。
@@ -77,7 +84,7 @@ bg_watch({ action: "kill", pid: 12345 })
 
 ## 环境要求
 
-- pi coding agent（任意近期版本）
+- pi coding agent / pi-tui >= 1.5.0
 - Linux 或 macOS（使用 `process.kill(pid, 0)` 检测存活）
 
 ## 许可证
