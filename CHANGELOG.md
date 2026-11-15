@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4
+
+- 通用进度源：log/file、heartbeat、tmux/pty；空日志按任务是否仍在运行区分提示；tmux 异步读取；output 的 log_file 可覆盖已记录来源
+
 ## 0.1.3
 
 - TUI widget: collapse each task by default; fullscreen task-row clicks expand or collapse its summary, with regular-mode keyboard fallback

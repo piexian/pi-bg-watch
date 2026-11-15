@@ -13,11 +13,11 @@ Watches background processes and automatically notifies the session when they ex
 | `watch` | Attach a completion watcher to a running background PID |
 | `list` | Show all watched tasks with live status |
 | `status` | Detailed info: process alive, elapsed time, watcher health |
-| `output` | Read log file tail on demand (no need to wait for completion) |
+| `output` | Read a progress source on demand (log tail / heartbeat / tmux; no need to wait for completion) |
 | `cancel` | Stop monitoring (target process keeps running) |
 | `kill` | Terminate target process (SIGTERM → grace period → SIGKILL) |
 
-**TUI integration**: Static footer status line (`● 2 bg tasks running`); the widget above the editor uses a theme-accent animation and lists active tasks with elapsed time (up to 12 lines), collapsed per task by default; click a task row in fullscreen mode to expand or collapse up to 3 log-summary lines, while regular TUI uses `Ctrl+Shift+B` to expand or collapse all and `Ctrl+Shift+PgUp/PgDn` to scroll.
+**TUI integration**: Static footer status line (`● 2 bg tasks running`); the widget above the editor uses a theme-accent animation and lists active tasks with elapsed time (up to 12 lines), collapsed per task by default; click a task row in fullscreen mode to expand or collapse up to 3 progress-summary lines, while regular TUI uses `Ctrl+Shift+B` to expand or collapse all and `Ctrl+Shift+PgUp/PgDn` to scroll.
 
 **Log panel**: `/bg-watch logs <pid>` opens a panel with `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scrolling; scrolling up pauses follow and `End` resumes; `Esc`/`q` closes. Title and hints stay fixed; content refreshes every second.
 
@@ -46,6 +46,8 @@ git clone https://github.com/piexian/pi-bg-watch ~/.pi/agent/extensions/pi-bg-wa
 ```
 # After launching a background process:
 bg_watch({ action: "watch", pid: 12345, label: "npm build", log_file: "/tmp/build.log" })
+bg_watch({ action: "watch", pid: 12345, label: "job", progress_source: { type: "heartbeat", path: "/tmp/job.json" } })
+bg_watch({ action: "watch", pid: 12345, label: "shell", progress_source: { type: "tmux", target: "build:0.0" } })
 
 # Check progress (only when user asks):
 bg_watch({ action: "output", pid: 12345 })
@@ -56,6 +58,8 @@ bg_watch({ action: "cancel", pid: 12345 })
 # Kill the process:
 bg_watch({ action: "kill", pid: 12345 })
 ```
+`progress_source` is optional; `log_file` is used when it is omitted. Heartbeat JSON fields: `state` / `phase` / `message` / `progress` (0-1) / `updatedAt` (unix ms or ISO). Write via temp file + rename. A missing or invalid file degrades to a status message and is not treated as task failure.
+
 
 ### As a slash command
 

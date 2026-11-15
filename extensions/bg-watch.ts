@@ -20,7 +20,7 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, replaceControlCharacters, ScrollView, stripTerminalSequences, Text, truncateToWidth, type TUI, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -36,15 +36,47 @@ const WIDGET_LOG_LINES = 3;
 const MAX_WIDGET_LINES = 12;
 const UI_SPINNER_INTERVAL_MS = 180;
 const LOG_PANEL_REFRESH_MS = 1_000;
+const TMUX_CAPTURE_TIMEOUT_MS = 400;
+const TMUX_CACHE_MS = 500;
+const HEARTBEAT_MAX_BYTES = 16 * 1024;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ─── Data Structures ───────────────────────────────────────
+
+type ProgressSourceType = "log" | "file" | "heartbeat" | "tmux" | "pty";
+
+type ProgressSource = {
+	type: ProgressSourceType;
+	path?: string;
+	target?: string;
+};
+
+type ProgressKind =
+	| "content"
+	| "unconfigured"
+	| "unreadable"
+	| "empty-running"
+	| "empty-exited"
+	| "alive-no-progress"
+	| "exited-no-progress"
+	| "heartbeat-missing"
+	| "heartbeat-invalid"
+	| "tmux-unavailable"
+	| "tmux-target"
+	| "tmux-timeout"
+	| "tmux-pending";
+
+type ProgressSnapshot = {
+	kind: ProgressKind;
+	text: string;
+};
 
 type WatchRecord = {
 	pid: number;
 	label: string;
 	sessionId?: string; // owning session
 	logFile?: string;
+	progressSource?: ProgressSource;
 	quiet?: boolean;
 	startedAt: number;
 	watcherPid?: number; // watcher subprocess PID, for cleanup on cancel
@@ -89,6 +121,282 @@ function killPid(pid: number, signal: NodeJS.Signals = "SIGTERM"): boolean {
 	} catch {
 		return false;
 	}
+}
+
+// Unified progress snapshot: widget, panel, output, and completion all read through here.
+type TmuxRaw =
+	| { ok: true; text: string }
+	| { ok: false; kind: "tmux-unavailable" | "tmux-target" | "tmux-timeout"; text: string };
+
+type TmuxCacheEntry = {
+	at: number;
+	raw?: TmuxRaw;
+	inflight?: Promise<TmuxRaw>;
+};
+
+const tmuxCaptureCache = new Map<string, TmuxCacheEntry>();
+let tmuxDidUpdate: (() => void) | undefined;
+
+function cleanLine(value: string): string {
+	return replaceControlCharacters(stripTerminalSequences(value)).replace(/\s+/g, " ").trim();
+}
+
+function formatAge(ts: number): string {
+	const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+	if (s > 3600) return `${Math.floor(s / 3600)}h 前`;
+	if (s > 60) return `${Math.floor(s / 60)}m 前`;
+	return `${s}s 前`;
+}
+
+function emptyLogSnapshot(alive: boolean): ProgressSnapshot {
+	return alive
+		? { kind: "empty-running", text: "暂无可用日志，任务仍在运行" }
+		: { kind: "empty-exited", text: "任务已结束且日志为空" };
+}
+
+function noProgressSnapshot(alive: boolean): ProgressSnapshot {
+	return alive
+		? { kind: "alive-no-progress", text: "进程存活，暂无可读进度" }
+		: { kind: "exited-no-progress", text: "任务已结束，暂无可读进度" };
+}
+
+function describeProgressSource(source: ProgressSource | undefined): string {
+	if (!source) return "未配置";
+	if (source.type === "heartbeat") return source.path ? `heartbeat ${source.path}` : "heartbeat";
+	if (source.type === "tmux" || source.type === "pty") return source.target ? `${source.type} ${source.target}` : source.type;
+	return source.path ? `${source.type} ${source.path}` : source.type;
+}
+
+function normalizeProgressSource(source: ProgressSource | undefined, logFile: string | undefined): ProgressSource | undefined {
+	if (source) {
+		if ((source.type === "log" || source.type === "file") && !source.path && logFile) {
+			return { type: source.type, path: logFile };
+		}
+		return source;
+	}
+	if (logFile) return { type: "log", path: logFile };
+	return undefined;
+}
+
+function resolveOutputSource(
+	requested: ProgressSource | undefined,
+	logFile: string | undefined,
+	rec: WatchRecord | null | undefined,
+): ProgressSource | undefined {
+	if (requested) return normalizeProgressSource(requested, logFile ?? rec?.logFile);
+	if (logFile) return { type: "log", path: logFile };
+	return normalizeProgressSource(rec?.progressSource, rec?.logFile);
+}
+
+function progressSourceError(source: ProgressSource | undefined): string | undefined {
+	if (!source) return;
+	if ((source.type === "log" || source.type === "file") && !source.path) return "progress_source.type=log/file 需要 path";
+	if (source.type === "heartbeat" && !source.path) return "progress_source.type=heartbeat 需要 path";
+	if ((source.type === "tmux" || source.type === "pty") && !source.target) return "progress_source.type=tmux/pty 需要 target";
+	return;
+}
+
+function isProgressReadError(kind: ProgressKind): boolean {
+	return kind === "unconfigured"
+		|| kind === "unreadable"
+		|| kind === "heartbeat-missing"
+		|| kind === "heartbeat-invalid"
+		|| kind === "tmux-unavailable"
+		|| kind === "tmux-target"
+		|| kind === "tmux-timeout";
+}
+
+function readLogTail(logFile: string, lines = 30, maxBytes = LOG_TAIL_BYTES): string | null {
+	const lineLimit = Number.isFinite(lines) ? Math.min(1_000, Math.max(1, Math.floor(lines))) : 30;
+	const byteLimit = Number.isFinite(maxBytes) ? Math.min(LOG_TAIL_BYTES, Math.max(1, Math.floor(maxBytes))) : LOG_TAIL_BYTES;
+	const truncatedMark = "[truncated] ";
+	let fd: number | undefined;
+	try {
+		fd = openSync(logFile, "r");
+		const size = fstatSync(fd).size;
+		const start = Math.max(0, size - byteLimit);
+		const length = size - start;
+		const buffer = Buffer.alloc(length);
+		const bytesRead = length > 0 ? readSync(fd, buffer, 0, length, start) : 0;
+		if (bytesRead === 0) return "";
+		// Skip continuation bytes of a character split by the window start.
+		let decodeStart = 0;
+		if (start > 0) while (decodeStart < bytesRead && (buffer[decodeStart] & 0xc0) === 0x80) decodeStart++;
+		let content = buffer.toString("utf8", decodeStart, bytesRead).replace(/\r\n?/g, "\n");
+		if (start > 0) {
+			const newline = content.indexOf("\n");
+			if (newline < 0) content = `${truncatedMark}${content}`;
+			else if (newline === content.length - 1) content = `${truncatedMark}${content.slice(0, -1)}`;
+			// Drop the partial first line, then keep the last N whole lines.
+			else content = content.slice(newline + 1);
+		}
+		if (content.endsWith("\n")) content = content.slice(0, -1);
+		const cleaned = content
+			.split("\n")
+			.map((line) => replaceControlCharacters(stripTerminalSequences(line)).trimEnd());
+		return cleaned.slice(-lineLimit).join("\n");
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+function readHeartbeat(path: string, alive: boolean): ProgressSnapshot {
+	let fd: number | undefined;
+	try {
+		fd = openSync(path, "r");
+		const size = fstatSync(fd).size;
+		if (size > HEARTBEAT_MAX_BYTES) {
+			return { kind: "heartbeat-invalid", text: `heartbeat 解析失败：${path}` };
+		}
+		const buffer = Buffer.alloc(size);
+		const bytesRead = size > 0 ? readSync(fd, buffer, 0, size, 0) : 0;
+		let data: unknown;
+		try {
+			data = JSON.parse(buffer.toString("utf8", 0, bytesRead));
+		} catch {
+			return { kind: "heartbeat-invalid", text: `heartbeat 解析失败：${path}` };
+		}
+		if (!data || typeof data !== "object" || Array.isArray(data)) {
+			return { kind: "heartbeat-invalid", text: `heartbeat 解析失败：${path}` };
+		}
+		const obj = data as Record<string, unknown>;
+		const parts: string[] = [];
+		if (typeof obj.state === "string" && obj.state.trim()) parts.push(cleanLine(obj.state));
+		if (typeof obj.phase === "string" && obj.phase.trim()) parts.push(cleanLine(obj.phase));
+		if (obj.progress !== undefined) {
+			if (typeof obj.progress !== "number" || !Number.isFinite(obj.progress) || obj.progress < 0 || obj.progress > 1) {
+				return { kind: "heartbeat-invalid", text: `heartbeat 解析失败：${path}` };
+			}
+			parts.push(`${Math.round(obj.progress * 100)}%`);
+		}
+		if (typeof obj.message === "string" && obj.message.trim()) parts.push(cleanLine(obj.message));
+		if (obj.updatedAt !== undefined) {
+			const ts = typeof obj.updatedAt === "number"
+				? obj.updatedAt
+				: typeof obj.updatedAt === "string"
+					? Date.parse(obj.updatedAt)
+					: Number.NaN;
+			if (Number.isFinite(ts)) parts.push(formatAge(ts));
+		}
+		if (parts.length === 0) return noProgressSnapshot(alive);
+		return { kind: "content", text: parts.join(" · ") };
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		if (code === "ENOENT") return { kind: "heartbeat-missing", text: `heartbeat 文件不存在：${path}` };
+		return { kind: "unreadable", text: `heartbeat 文件不可读：${path}` };
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+function tmuxLineLimit(lines: number): number {
+	return Number.isFinite(lines) ? Math.min(1_000, Math.max(1, Math.floor(lines))) : 80;
+}
+
+function tmuxCacheKey(target: string, lineLimit: number): string {
+	return `${target}\0${lineLimit}`;
+}
+
+function pruneTmuxCache(now: number): void {
+	for (const [key, entry] of tmuxCaptureCache) {
+		if (entry.inflight) continue;
+		if (now - entry.at >= TMUX_CACHE_MS) tmuxCaptureCache.delete(key);
+	}
+}
+
+function snapshotFromTmuxRaw(raw: TmuxRaw | undefined, alive: boolean, pending: boolean): ProgressSnapshot {
+	if (raw) {
+		if (!raw.ok) return { kind: raw.kind, text: raw.text };
+		if (!raw.text) return noProgressSnapshot(alive);
+		return { kind: "content", text: raw.text };
+	}
+	if (pending) return { kind: "tmux-pending", text: "tmux 读取中" };
+	return { kind: "tmux-unavailable", text: "tmux 不可用" };
+}
+
+function runTmuxCapture(target: string, lineLimit: number): Promise<TmuxRaw> {
+	const displayTarget = cleanLine(target) || target;
+	return new Promise((resolve) => {
+		execFile("tmux", ["capture-pane", "-p", "-t", target, "-S", `-${lineLimit}`], {
+			encoding: "utf8",
+			timeout: TMUX_CAPTURE_TIMEOUT_MS,
+			maxBuffer: LOG_TAIL_BYTES,
+			windowsHide: true,
+		}, (err, stdout) => {
+			if (!err) {
+				const cleaned = String(stdout ?? "")
+					.replace(/\r\n?/g, "\n")
+					.split("\n")
+					.map((line) => replaceControlCharacters(stripTerminalSequences(line)).trimEnd());
+				while (cleaned.length > 0 && cleaned[cleaned.length - 1] === "") cleaned.pop();
+				resolve({ ok: true, text: cleaned.slice(-lineLimit).join("\n") });
+				return;
+			}
+			const e = err as NodeJS.ErrnoException & { killed?: boolean };
+			if (e.code === "ENOENT") resolve({ ok: false, kind: "tmux-unavailable", text: "tmux 不可用" });
+			else if (e.killed === true || e.code === "ETIMEDOUT") resolve({ ok: false, kind: "tmux-timeout", text: `tmux 读取超时：${displayTarget}` });
+			else resolve({ ok: false, kind: "tmux-target", text: `tmux 目标不可用：${displayTarget}` });
+		});
+	});
+}
+
+function ensureTmuxCapture(target: string, lineLimit: number): TmuxCacheEntry {
+	const now = Date.now();
+	pruneTmuxCache(now);
+	const key = tmuxCacheKey(target, lineLimit);
+	const existing = tmuxCaptureCache.get(key);
+	if (existing?.inflight) return existing;
+	if (existing?.raw && now - existing.at < TMUX_CACHE_MS) return existing;
+	const inflight = runTmuxCapture(target, lineLimit).then((raw) => {
+		tmuxCaptureCache.set(key, { at: Date.now(), raw });
+		tmuxDidUpdate?.();
+		return raw;
+	});
+	const entry: TmuxCacheEntry = { at: existing?.at ?? now, raw: existing?.raw, inflight };
+	tmuxCaptureCache.set(key, entry);
+	return entry;
+}
+
+function readTmuxProgress(target: string, lines: number, alive: boolean): ProgressSnapshot {
+	const lineLimit = tmuxLineLimit(lines);
+	const entry = ensureTmuxCapture(target, lineLimit);
+	return snapshotFromTmuxRaw(entry.raw, alive, !!entry.inflight && !entry.raw);
+}
+
+async function readTmuxProgressAsync(target: string, lines: number, alive: boolean): Promise<ProgressSnapshot> {
+	const lineLimit = tmuxLineLimit(lines);
+	const entry = ensureTmuxCapture(target, lineLimit);
+	const raw = entry.inflight ? await entry.inflight : entry.raw;
+	return snapshotFromTmuxRaw(raw, alive, false);
+}
+
+function readProgress(source: ProgressSource | undefined, opts: { alive: boolean; lines?: number; maxBytes?: number }): ProgressSnapshot {
+	const lines = opts.lines ?? 30;
+	const maxBytes = opts.maxBytes ?? LOG_TAIL_BYTES;
+	if (!source) return { kind: "unconfigured", text: "未配置进度源（无 progress_source / log_file）" };
+
+	if (source.type === "heartbeat") {
+		if (!source.path) return { kind: "unconfigured", text: "未配置进度源（heartbeat 缺少 path）" };
+		return readHeartbeat(source.path, opts.alive);
+	}
+	if (source.type === "tmux" || source.type === "pty") {
+		if (!source.target) return { kind: "unconfigured", text: "未配置进度源（tmux/pty 缺少 target）" };
+		return readTmuxProgress(source.target, lines, opts.alive);
+	}
+	if (!source.path) return { kind: "unconfigured", text: "未配置进度源（无 progress_source / log_file）" };
+	const tail = readLogTail(source.path, lines, maxBytes);
+	if (tail === null) return { kind: "unreadable", text: `进度源不可读：${source.path}` };
+	if (!tail.trim()) return emptyLogSnapshot(opts.alive);
+	return { kind: "content", text: tail };
+}
+
+async function readProgressAsync(source: ProgressSource | undefined, opts: { alive: boolean; lines?: number; maxBytes?: number }): Promise<ProgressSnapshot> {
+	if (source && (source.type === "tmux" || source.type === "pty") && source.target) {
+		return readTmuxProgressAsync(source.target, opts.lines ?? 30, opts.alive);
+	}
+	return readProgress(source, opts);
 }
 
 // ─── Detached Watcher Source ───────────────────────────────
@@ -263,9 +571,8 @@ export default function (pi: ExtensionAPI) {
 		private readonly tui: TUI;
 		private readonly theme: Theme;
 		private readonly view = new BoundedTextView();
-		private readonly pid: number;
-		private readonly label: string;
-		private readonly logFile?: string;
+		private readonly record: WatchRecord;
+		private sourceLabel = "未配置";
 		private readonly closePanel: () => void;
 		private readonly done: (result: undefined) => void;
 		private content = "";
@@ -276,17 +583,13 @@ export default function (pi: ExtensionAPI) {
 		constructor(
 			tui: TUI,
 			theme: Theme,
-			pid: number,
-			label: string,
-			logFile: string | undefined,
+			record: WatchRecord,
 			closePanel: () => void,
 			done: (result: undefined) => void,
 		) {
 			this.tui = tui;
 			this.theme = theme;
-			this.pid = pid;
-			this.label = label;
-			this.logFile = logFile;
+			this.record = record;
 			this.closePanel = closePanel;
 			this.done = done;
 			this.refresh();
@@ -297,26 +600,29 @@ export default function (pi: ExtensionAPI) {
 			this.timer.unref?.();
 		}
 
-		// Re-read tail at 1 Hz; empty / unreadable / unconfigured stay distinct.
+		// Re-read progress at 1 Hz; empty / unreadable / unconfigured stay distinct.
 		private refresh(): void {
-			if (this.logFile === undefined) this.content = "日志不可用：未设置 log_file";
-			else {
-				const tail = readLogTail(this.logFile, LOG_TAIL_LINES, LOG_TAIL_BYTES);
-				this.content = tail === null ? "日志不可用" : tail === "" ? "日志为空" : tail;
-			}
+			const source = normalizeProgressSource(this.record.progressSource, this.record.logFile);
+			const snapshot = readProgress(source, {
+				alive: isAlive(this.record.pid),
+				lines: LOG_TAIL_LINES,
+				maxBytes: LOG_TAIL_BYTES,
+			});
+			this.content = snapshot.text;
+			this.sourceLabel = describeProgressSource(source);
 		}
 
 		render(width: number): string[] {
 			if (this.closed) return [];
-			const label = replaceControlCharacters(stripTerminalSequences(this.label));
-			const path = this.logFile ? replaceControlCharacters(stripTerminalSequences(this.logFile)) : "未设置日志";
+			const label = replaceControlCharacters(stripTerminalSequences(this.record.label));
+			const path = replaceControlCharacters(stripTerminalSequences(this.sourceLabel));
 			const meta = this.theme.fg("muted", truncateToWidth(`${label} · ${path}`, width));
 			const hint = this.theme.fg("dim", truncateToWidth("↑↓ / PgUp PgDn / Home End · Esc 或 q 关闭", width));
 			// title + meta + hint + 1 spare row reserved from terminal height.
 			this.bodyHeight = Math.max(1, this.tui.terminal.rows - 4);
 			const body = this.view.render(this.content.split("\n"), width, this.bodyHeight, () => this.tui.requestRender());
 			return [
-				this.theme.fg("accent", truncateToWidth(`bg-watch logs · PID ${this.pid}`, width)),
+				this.theme.fg("accent", truncateToWidth(`bg-watch logs · PID ${this.record.pid}`, width)),
 				meta,
 				...body,
 				hint,
@@ -382,19 +688,14 @@ export default function (pi: ExtensionAPI) {
 			const start = lines.length;
 			lines.push(`${prefix}${alive ? "●" : "○"} PID ${record.pid}: ${label} (${formatDuration(Date.now() - record.startedAt)})${alive ? "" : " [exited]"}`);
 			if (expanded) {
-				if (!record.logFile) {
-					lines.push("    log unavailable: no log_file");
-				} else {
-					const tail = readLogTail(record.logFile, WIDGET_LOG_LINES, LOG_TAIL_BYTES);
-					if (tail === null) {
-						lines.push(`    log unavailable: ${truncateToWidth(replaceControlCharacters(stripTerminalSequences(record.logFile)), 100)}`);
-					} else if (!tail) {
-						lines.push("    log empty");
-					} else {
-						for (const line of tail.split("\n").slice(-WIDGET_LOG_LINES)) {
-							lines.push(`    ${truncateToWidth(line, 140)}`);
-						}
+				const source = normalizeProgressSource(record.progressSource, record.logFile);
+				const snapshot = readProgress(source, { alive, lines: WIDGET_LOG_LINES, maxBytes: LOG_TAIL_BYTES });
+				if (snapshot.kind === "content") {
+					for (const line of snapshot.text.split("\n").slice(-WIDGET_LOG_LINES)) {
+						lines.push(`    ${truncateToWidth(line, 140)}`);
 					}
+				} else {
+					lines.push(`    ${truncateToWidth(snapshot.text, 140)}`);
 				}
 			}
 			taskRows.push({ pid: record.pid, start, end: lines.length });
@@ -459,6 +760,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		widgetComponent?.setLines(latestWidgetLines, latestTaskRows);
 	}
+	tmuxDidUpdate = () => refreshUI();
 
 	pi.registerShortcut(Key.ctrlShift("b"), {
 		description: "Toggle bg-watch log summary",
@@ -585,7 +887,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function notifyDone(done: DoneRecord): void {
+	async function notifyDone(done: DoneRecord): Promise<void> {
 		const duration = Math.round((done.finishedAt - done.startedAt) / 1000);
 		const durationStr = duration > 3600
 			? `${Math.floor(duration / 3600)}h${Math.floor((duration % 3600) / 60)}m`
@@ -596,18 +898,16 @@ export default function (pi: ExtensionAPI) {
 		const lines = [
 			`[bg-watch] 后台任务已结束：${replaceControlCharacters(stripTerminalSequences(done.label))}（PID ${done.pid}，运行 ${durationStr}）${reason}`,
 			`后续操作：`,
-			`1. 查看日志：bg_watch({ action: "output", pid: ${done.pid} })`,
+			`1. 查看进度：bg_watch({ action: "output", pid: ${done.pid} })`,
 			`2. 确认产出：git status / 检查目标文件`,
 			`3. 如需重新运行：启动新进程后再次 bg_watch`,
 		];
-		// attach sanitized log tail on completion
-		const cleanPath = done.logFile ? replaceControlCharacters(stripTerminalSequences(done.logFile)) : "";
-		if (!done.logFile) lines.push("", "日志尾部不可用：未设置 log_file");
-		else {
-			const tail = readLogTail(done.logFile, 20, LOG_TAIL_BYTES);
-			if (tail === null) lines.push("", `日志尾部不可用：${cleanPath}`);
-			else if (tail === "") lines.push("", `日志为空：${cleanPath}`);
-			else lines.push("", `日志尾部（${cleanPath}）：`, "```", tail, "```");
+		const source = normalizeProgressSource(done.progressSource, done.logFile);
+		const snapshot = await readProgressAsync(source, { alive: false, lines: 20, maxBytes: LOG_TAIL_BYTES });
+		if (snapshot.kind === "content") {
+			lines.push("", `进度（${describeProgressSource(source)}）：`, "```", snapshot.text, "```");
+		} else {
+			lines.push("", snapshot.text);
 		}
 		// steer + triggerTurn: if agent is actively working (goal/streaming), the message
 		// queues and is delivered before the next LLM call (no interruption); if agent is
@@ -623,17 +923,17 @@ export default function (pi: ExtensionAPI) {
 	function startChecker(): void {
 		if (checkTimer) return;
 		checkTimer = setInterval(() => {
-			for (const done of consumeDone()) {
-				if (!done.quiet) notifyDone(done);
-			}
-			// refresh TUI display
-			refreshUI();
-			// stop timer when no active watches
-			if (listActive().length === 0 && checkTimer) {
-				clearInterval(checkTimer);
-				checkTimer = null;
-				refreshUI(); // clear widget/status
-			}
+			void (async () => {
+				for (const done of consumeDone()) {
+					if (!done.quiet) await notifyDone(done);
+				}
+				refreshUI();
+				if (listActive().length === 0 && checkTimer) {
+					clearInterval(checkTimer);
+					checkTimer = null;
+					refreshUI();
+				}
+			})();
 		}, CHECK_INTERVAL_MS);
 		checkTimer.unref?.();
 	}
@@ -645,41 +945,6 @@ export default function (pi: ExtensionAPI) {
 		return `${s}s`;
 	}
 
-	function readLogTail(logFile: string, lines = 30, maxBytes = LOG_TAIL_BYTES): string | null {
-		const lineLimit = Number.isFinite(lines) ? Math.min(1_000, Math.max(1, Math.floor(lines))) : 30;
-		const byteLimit = Number.isFinite(maxBytes) ? Math.min(LOG_TAIL_BYTES, Math.max(1, Math.floor(maxBytes))) : LOG_TAIL_BYTES;
-		const truncatedMark = "[truncated] ";
-		let fd: number | undefined;
-		try {
-			fd = openSync(logFile, "r");
-			const size = fstatSync(fd).size;
-			const start = Math.max(0, size - byteLimit);
-			const length = size - start;
-			const buffer = Buffer.alloc(length);
-			const bytesRead = length > 0 ? readSync(fd, buffer, 0, length, start) : 0;
-			if (bytesRead === 0) return "";
-			// Skip continuation bytes of a character split by the window start.
-			let decodeStart = 0;
-			if (start > 0) while (decodeStart < bytesRead && (buffer[decodeStart] & 0xc0) === 0x80) decodeStart++;
-			let content = buffer.toString("utf8", decodeStart, bytesRead).replace(/\r\n?/g, "\n");
-			if (start > 0) {
-				const newline = content.indexOf("\n");
-				if (newline < 0) content = `${truncatedMark}${content}`;
-				else if (newline === content.length - 1) content = `${truncatedMark}${content.slice(0, -1)}`;
-				// Drop the partial first line, then keep the last N whole lines.
-				else content = content.slice(newline + 1);
-			}
-			if (content.endsWith("\n")) content = content.slice(0, -1);
-			const cleaned = content
-				.split("\n")
-				.map((line) => replaceControlCharacters(stripTerminalSequences(line)).trimEnd());
-			return cleaned.slice(-lineLimit).join("\n");
-		} catch {
-			return null;
-		} finally {
-			if (fd !== undefined) closeSync(fd);
-		}
-	}
 
 	async function openLogPanel(pid: number, ctx: ExtensionContext): Promise<void> {
 		const record = loadRecord(pid);
@@ -692,12 +957,12 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("日志面板仅在 TUI 模式可用；请使用 bg_watch output 查看一次日志。", "warning");
+			ctx.ui.notify("日志面板仅在 TUI 模式可用；请使用 bg_watch output 查看一次进度。", "warning");
 			return;
 		}
 		await ctx.ui.custom<undefined>(
 			(tui, theme, _keybindings, done) => {
-				const panel = new LiveLogPanel(tui, theme, pid, record.label, record.logFile, () => {
+				const panel = new LiveLogPanel(tui, theme, record, () => {
 					activeLogPanel = null;
 				}, done);
 				activeLogPanel = panel;
@@ -716,13 +981,14 @@ export default function (pi: ExtensionAPI) {
 			"后台任务生命周期管理：挂监控(watch)、查状态(status)、看输出(output)、取消监控(cancel)、终止进程(kill)、列清单(list)。" +
 			"启动后台进程后立即 watch 挂上完成通知，系统会在进程退出时自动推送消息，无需轮询。" +
 			"挂上监控后应继续做其他事或结束当前回合等待通知，禁止循环调用 status/output 来等待完成。" +
-			"仅在用户主动要求时才用 output 查看一次日志；需要中途干预时用 cancel/kill。",
+			"仅在用户主动要求时才用 output 查看一次进度；需要中途干预时用 cancel/kill。",
 		promptSnippet: "Manage background tasks: watch, status, output, cancel, kill, list",
 		promptGuidelines: [
 			"After launching any long-running background process (nohup, &, detached), call bg_watch with its PID so completion is reported automatically.",
 			"CRITICAL: After calling bg_watch(action=watch), do NOT poll, loop, sleep, or repeatedly call status/output to check progress. The system will automatically inject a completion message into the conversation when the process exits. Continue with other work or end your turn and wait.",
 			"NEVER use bash sleep/wait loops or repeated bg_watch(action=status) calls to wait for a background task. This defeats the purpose of the tool and wastes tokens.",
-			"If the user explicitly asks to check progress, use action=output ONCE to show the log tail. Do not loop.",
+			"If the user explicitly asks to check progress, use action=output ONCE to show the progress source. Do not loop.",
+			"When watching, pass log_file or an explicit progress_source (log/file, heartbeat, tmux/pty). Do not infer the source from command.",
 			"Use action=cancel to stop monitoring (process keeps running); action=kill to terminate the process itself.",
 		],
 		parameters: Type.Object({
@@ -736,7 +1002,18 @@ export default function (pi: ExtensionAPI) {
 			], { description: "操作类型，默认 watch" })),
 			pid: Type.Optional(Type.Number({ description: "目标进程 PID（watch/status/output/cancel/kill 时必填）" })),
 			label: Type.Optional(Type.String({ description: "任务描述标签（watch 时必填）" })),
-			log_file: Type.Optional(Type.String({ description: "日志文件路径，output 时读取尾部；watch 时记录以便完成时附带" })),
+			log_file: Type.Optional(Type.String({ description: "普通文本日志路径；未设置 progress_source 时作为 log 进度源" })),
+			progress_source: Type.Optional(Type.Object({
+				type: Type.Union([
+					Type.Literal("log"),
+					Type.Literal("file"),
+					Type.Literal("heartbeat"),
+					Type.Literal("tmux"),
+					Type.Literal("pty"),
+				], { description: "log/file 读文本尾部；heartbeat 读 JSON 状态文件；tmux/pty 按 target 调用 tmux capture-pane" }),
+				path: Type.Optional(Type.String({ description: "log/file/heartbeat 的文件路径" })),
+				target: Type.Optional(Type.String({ description: "tmux/pty 的 capture-pane 目标，例如 session:window.pane" })),
+			})),
 			quiet: Type.Optional(Type.Boolean({ description: "为 true 时完成不发提醒（默认 false）" })),
 			lines: Type.Optional(Type.Number({ description: "output 时读取的尾部行数（默认 30）" })),
 			command: Type.Optional(Type.String({ description: "可选：原始命令描述，便于 list 时识别" })),
@@ -788,18 +1065,24 @@ export default function (pi: ExtensionAPI) {
 						try {
 							const done = JSON.parse(readFileSync(dp, "utf8")) as DoneRecord;
 							unlinkSync(dp);
-							if (!done.quiet) notifyDone(done);
+							if (!done.quiet) await notifyDone(done);
 						} catch { /* corrupt file, just delete */ try { unlinkSync(dp); } catch {} }
 						refreshUI();
 						return { content: [{ type: "text", text: `PID ${pid} 已退出，完成通知已补发。无需重新挂监控。` }], details: undefined };
 					}
 					return { content: [{ type: "text", text: `PID ${pid} 不存在或已退出，无法挂监控。` }], details: undefined, isError: true };
 				}
+				const progressSource = normalizeProgressSource(params.progress_source, params.log_file);
+				const sourceErr = progressSourceError(progressSource);
+				if (sourceErr) {
+					return { content: [{ type: "text", text: `bg_watch watch: ${sourceErr}` }], details: undefined, isError: true };
+				}
 				const record: WatchRecord = {
 					pid,
 					label: params.label,
 					sessionId: currentSessionId,
-					logFile: params.log_file,
+					logFile: params.log_file ?? ((progressSource?.type === "log" || progressSource?.type === "file") ? progressSource.path : undefined),
+					progressSource,
 					quiet: params.quiet,
 					startedAt: Date.now(),
 					command: params.command,
@@ -808,7 +1091,7 @@ export default function (pi: ExtensionAPI) {
 				startChecker();
 				refreshUI();
 				return {
-					content: [{ type: "text", text: `已挂监控：PID ${pid}（${params.label}），watcher=${watcherPid}。\n⚠️ 进程退出时系统会自动推送通知，无需轮询。请继续其他工作或结束当前回合等待。\n中途可用 action=output 查看一次日志，action=cancel 取消监控，action=kill 终止进程。` }],
+					content: [{ type: "text", text: `已挂监控：PID ${pid}（${params.label}），watcher=${watcherPid}。\n⚠️ 进程退出时系统会自动推送通知，无需轮询。请继续其他工作或结束当前回合等待。\n中途可用 action=output 查看一次进度，action=cancel 取消监控，action=kill 终止进程。` }],
 					details: { pid, label: params.label, watcherPid },
 				};
 			}
@@ -831,6 +1114,7 @@ export default function (pi: ExtensionAPI) {
 					`PID：${pid}（${alive ? "运行中" : "已退出"}）`,
 					`已运行：${elapsed}`,
 					`Watcher：${rec.watcherPid ?? "未知"}（${watcherAlive ? "健康" : "已退出 ⚠️"}）`,
+					`进度源：${describeProgressSource(normalizeProgressSource(rec.progressSource, rec.logFile))}`,
 					`日志：${rec.logFile ?? "未设置"}`,
 					`命令：${rec.command ?? "未记录"}`,
 				];
@@ -842,18 +1126,21 @@ export default function (pi: ExtensionAPI) {
 			// ── output ──
 			if (action === "output") {
 				const rec = loadRecord(pid);
-				const logFile = params.log_file ?? rec?.logFile;
-				if (!logFile) {
-					return { content: [{ type: "text", text: `PID ${pid} 未关联日志文件。请提供 log_file 参数。` }], details: undefined, isError: true };
-				}
-				const tail = readLogTail(logFile, params.lines ?? 30);
-				if (tail === null) {
-					return { content: [{ type: "text", text: `日志文件不存在或不可读：${logFile}` }], details: undefined, isError: true };
+				const progressSource = resolveOutputSource(params.progress_source, params.log_file, rec);
+				const sourceErr = progressSourceError(progressSource);
+				if (sourceErr) {
+					return { content: [{ type: "text", text: `bg_watch output: ${sourceErr}` }], details: undefined, isError: true };
 				}
 				const alive = isAlive(pid);
+				const snapshot = await readProgressAsync(progressSource, { alive, lines: params.lines ?? 30, maxBytes: LOG_TAIL_BYTES });
+				const header = `[${alive ? "运行中" : "已退出"}]`;
+				const text = snapshot.kind === "content"
+					? `${header} ${describeProgressSource(progressSource)}：\n\`\`\`\n${snapshot.text}\n\`\`\``
+					: `${header} ${snapshot.text}`;
 				return {
-					content: [{ type: "text", text: `[${alive ? "运行中" : "已退出"}] ${logFile} 尾部：\n\`\`\`\n${tail}\n\`\`\`` }],
+					content: [{ type: "text", text }],
 					details: undefined,
+					isError: isProgressReadError(snapshot.kind) || undefined,
 				};
 			}
 
@@ -1042,15 +1329,18 @@ export default function (pi: ExtensionAPI) {
 		cleanupStaleRecords();
 
 		// consume done files for THIS session only
+		tmuxDidUpdate = () => refreshUI();
 		const pending = consumeDone();
 		for (const done of pending) {
-			if (!done.quiet) notifyDone(done);
+			if (!done.quiet) await notifyDone(done);
 		}
 		if (listActive().length > 0) startChecker();
 		refreshUI();
 	});
 
 	pi.on("session_shutdown", () => {
+		tmuxDidUpdate = undefined;
+		tmuxCaptureCache.clear();
 		if (checkTimer) clearInterval(checkTimer);
 		checkTimer = null;
 		if (uiRef) {

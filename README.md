@@ -13,17 +13,17 @@ pi 编码代理的后台任务生命周期管理扩展。
 | `watch` | 给一个正在运行的后台 PID 挂上完成通知 |
 | `list` | 列出所有监控中的任务及实时状态 |
 | `status` | 详细信息：进程存活、运行时长、watcher 健康状态 |
-| `output` | 按需读取日志文件尾部（不必等完成） |
+| `output` | 按需读取进度源（日志尾部 / heartbeat / tmux，不必等完成） |
 | `cancel` | 取消监控（目标进程继续运行） |
 | `kill` | 终止目标进程（SIGTERM → 宽限期 → SIGKILL） |
 
-**TUI 集成**：底部状态栏静态显示 `● 2 bg tasks running`；编辑器上方 widget 使用主题 accent 动画，列出活跃任务及运行时长（最多 12 行），任务默认逐项折叠；fullscreen 点击任务行展开/收起最多 3 行日志摘要，regular TUI 用 `Ctrl+Shift+B` 全量展开/收起，`Ctrl+Shift+PgUp/PgDn` 滚动。
+**TUI 集成**：底部状态栏静态显示 `● 2 bg tasks running`；编辑器上方 widget 使用主题 accent 动画，列出活跃任务及运行时长（最多 12 行），任务默认逐项折叠；fullscreen 点击任务行展开/收起最多 3 行进度摘要，regular TUI 用 `Ctrl+Shift+B` 全量展开/收起，`Ctrl+Shift+PgUp/PgDn` 滚动。
 
 **日志面板**：`/bg-watch logs <pid>` 打开面板，`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 滚动，上滚暂停跟随、`End` 恢复，`Esc`/`q` 关闭；标题与提示固定，每秒刷新。
 
 **有界读取**：日志尾部最多读 32 KiB；`output` 默认 30 行、最多 1000 行，面板最多 80 行，完成摘要最多 20 行；清理控制字符，超长单行标记截断。
 
-**非 TUI**：RPC 模式保留最多 12 行的字符串 widget；print/json 模式无 UI，仅在用户要求时用 `bg_watch output` 查看日志。
+**非 TUI**：RPC 模式保留最多 12 行的字符串 widget；print/json 模式无 UI，仅在用户要求时用 `bg_watch output` 查看进度。
 
 **自动恢复**：如果 watcher 异常退出（崩溃/重启）或进程在会话中断期间结束，重新 watch 同一 PID 时会自动清理残留状态并补发遗漏的完成通知。
 
@@ -46,6 +46,8 @@ git clone https://github.com/piexian/pi-bg-watch ~/.pi/agent/extensions/pi-bg-wa
 ```
 # 启动后台进程后挂监控：
 bg_watch({ action: "watch", pid: 12345, label: "npm build", log_file: "/tmp/build.log" })
+bg_watch({ action: "watch", pid: 12345, label: "job", progress_source: { type: "heartbeat", path: "/tmp/job.json" } })
+bg_watch({ action: "watch", pid: 12345, label: "shell", progress_source: { type: "tmux", target: "build:0.0" } })
 
 # 查看进度（仅在用户主动要求时）：
 bg_watch({ action: "output", pid: 12345 })
@@ -56,6 +58,8 @@ bg_watch({ action: "cancel", pid: 12345 })
 # 终止进程：
 bg_watch({ action: "kill", pid: 12345 })
 ```
+
+`progress_source` 可选，未设置时使用 `log_file`。heartbeat JSON：`state` / `phase` / `message` / `progress`(0-1) / `updatedAt`（毫秒时间戳或 ISO）；生产者用临时文件 + rename 写入。缺失或解析失败会降级提示，不视为任务失败。
 
 ### 斜杠命令
 
