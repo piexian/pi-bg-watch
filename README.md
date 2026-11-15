@@ -17,7 +17,7 @@ pi 编码代理的后台任务生命周期管理扩展。
 | `cancel` | 取消监控（目标进程继续运行） |
 | `kill` | 终止目标进程（SIGTERM → 宽限期 → SIGKILL） |
 
-**TUI 集成**：底部状态栏静态显示 `● 2 bg tasks running`；编辑器上方 widget 使用主题 accent 动画，列出活跃任务及运行时长（最多 12 行）；`Ctrl+Shift+B` 折叠/展开每任务最多 3 行日志摘要，`Ctrl+Shift+PgUp/PgDn` 滚动。
+**TUI 集成**：底部状态栏静态显示 `● 2 bg tasks running`；编辑器上方 widget 使用主题 accent 动画，列出活跃任务及运行时长（最多 12 行），任务默认逐项折叠；fullscreen 点击任务行展开/收起最多 3 行日志摘要，regular TUI 用 `Ctrl+Shift+B` 全量展开/收起，`Ctrl+Shift+PgUp/PgDn` 滚动。
 
 **日志面板**：`/bg-watch logs <pid>` 打开面板，`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 滚动，上滚暂停跟随、`End` 恢复，`Esc`/`q` 关闭；标题与提示固定，每秒刷新。
 

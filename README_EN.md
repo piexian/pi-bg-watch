@@ -17,7 +17,7 @@ Watches background processes and automatically notifies the session when they ex
 | `cancel` | Stop monitoring (target process keeps running) |
 | `kill` | Terminate target process (SIGTERM → grace period → SIGKILL) |
 
-**TUI integration**: Static footer status line (`● 2 bg tasks running`); the widget above the editor uses a theme-accent animation and lists active tasks with elapsed time (up to 12 lines); `Ctrl+Shift+B` toggles a per-task log summary (up to 3 lines), `Ctrl+Shift+PgUp/PgDn` scrolls.
+**TUI integration**: Static footer status line (`● 2 bg tasks running`); the widget above the editor uses a theme-accent animation and lists active tasks with elapsed time (up to 12 lines), collapsed per task by default; click a task row in fullscreen mode to expand or collapse up to 3 log-summary lines, while regular TUI uses `Ctrl+Shift+B` to expand or collapse all and `Ctrl+Shift+PgUp/PgDn` to scroll.
 
 **Log panel**: `/bg-watch logs <pid>` opens a panel with `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scrolling; scrolling up pauses follow and `End` resumes; `Esc`/`q` closes. Title and hints stay fixed; content refreshes every second.
 

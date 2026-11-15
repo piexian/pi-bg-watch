@@ -18,7 +18,7 @@
  * Claude Code (BashOutput / KillBash separation).
  */
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, replaceControlCharacters, ScrollView, stripTerminalSequences, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+import { Key, matchesKey, replaceControlCharacters, ScrollView, stripTerminalSequences, Text, truncateToWidth, type TUI, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
@@ -140,6 +140,10 @@ export default function (pi: ExtensionAPI) {
 			return this.scroller.isFollowingEnd;
 		}
 
+		get scrollTop(): number {
+			return this.scroller.scrollTop;
+		}
+
 		render(lines: string[], width: number, height: number, requestRender: () => void): string[] {
 			const allowed = Math.max(1, height);
 			const display = lines.map((line) =>
@@ -168,20 +172,30 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	type WidgetTaskRow = {
+		pid: number;
+		start: number;
+		end: number;
+	};
+
 	class BackgroundTaskWidget {
 		private readonly tui: TUI;
 		private readonly theme: Theme;
 		private readonly view = new BoundedTextView();
+		private readonly onTogglePid: (pid: number) => void;
 		private lines: string[] = [];
+		private taskRows: WidgetTaskRow[] = [];
+		private lastScrollTop = 0;
 		private frame = 0;
 		private bodyHeight = MAX_WIDGET_LINES - 1;
 		private timer: ReturnType<typeof setInterval> | null = null;
 		private disposed = false;
 
-		constructor(tui: TUI, theme: Theme, lines: string[]) {
+		constructor(tui: TUI, theme: Theme, lines: string[], taskRows: WidgetTaskRow[], onTogglePid: (pid: number) => void) {
 			this.tui = tui;
 			this.theme = theme;
-			this.setLines(lines);
+			this.onTogglePid = onTogglePid;
+			this.setLines(lines, taskRows);
 			this.timer = setInterval(() => {
 				if (this.disposed) return;
 				this.frame = (this.frame + 1) % SPINNER_FRAMES.length;
@@ -190,9 +204,10 @@ export default function (pi: ExtensionAPI) {
 			this.timer.unref?.();
 		}
 
-		setLines(lines: string[]): void {
+		setLines(lines: string[], taskRows: WidgetTaskRow[]): void {
 			if (this.disposed) return;
 			this.lines = lines;
+			this.taskRows = taskRows;
 			if (this.view.isFollowingEnd) this.view.scrollToEnd();
 			this.tui.requestRender();
 		}
@@ -205,10 +220,24 @@ export default function (pi: ExtensionAPI) {
 			const maxTotal = Math.min(MAX_WIDGET_LINES, this.tui.terminal.rows - 1);
 			this.bodyHeight = Math.max(1, maxTotal - 1);
 			const clipped = this.view.render(body, width, this.bodyHeight, () => this.tui.requestRender());
-			return [truncateToWidth(`${icon} ${header}`, width), ...clipped];
+			this.lastScrollTop = this.view.scrollTop;
+			const hint = this.tui.mode === "fullscreen" ? "点击任务展开/收起" : "Ctrl+Shift+B 全部展开/收起";
+			return [truncateToWidth(`${icon} ${header} · ${hint}`, width), ...clipped];
 		}
 
 		invalidate(): void {}
+
+		handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+			if (this.disposed) return;
+			if (this.tui.mode !== "fullscreen") return;
+			if (event.type !== "click" || event.button !== "left") return;
+			const sourceIndex = event.y <= 0 ? 0 : event.y + this.lastScrollTop;
+			const hit = this.taskRows.find((row) => sourceIndex >= row.start && sourceIndex < row.end);
+			if (!hit) return;
+			this.onTogglePid(hit.pid);
+			this.tui.requestRender();
+			return { handled: true };
+		}
 
 		scrollBy(delta: number): void {
 			if (this.disposed) return;
@@ -335,37 +364,52 @@ export default function (pi: ExtensionAPI) {
 	let widgetComponent: BackgroundTaskWidget | null = null;
 	let activeLogPanel: LiveLogPanel | null = null;
 	let widgetMountRequested = false;
-	let widgetExpanded = false;
+	const expandedPids = new Set<number>();
 	let latestWidgetLines: string[] = [];
+	let latestTaskRows: WidgetTaskRow[] = [];
 
 	// ── TUI Display ──
 
-	function buildWidgetLines(active: WatchRecord[]): string[] {
+	function buildWidgetLines(active: WatchRecord[], expandedPids: ReadonlySet<number>, interactive: boolean): { lines: string[]; taskRows: WidgetTaskRow[] } {
 		const running = active.filter((record) => isAlive(record.pid)).length;
-		const lines = [`bg-watch · ${running}/${active.length} running · Ctrl+Shift+B ${widgetExpanded ? "折叠" : "展开"}`];
+		const lines = [`bg-watch · ${running}/${active.length} running`];
+		const taskRows: WidgetTaskRow[] = [];
 		for (const record of active) {
 			const alive = isAlive(record.pid);
 			const label = truncateToWidth(replaceControlCharacters(stripTerminalSequences(record.label)), 80);
-			lines.push(`  ${alive ? "●" : "○"} PID ${record.pid}: ${label} (${formatDuration(Date.now() - record.startedAt)})${alive ? "" : " [exited]"}`);
-			if (!widgetExpanded) continue;
-			if (!record.logFile) {
-				lines.push("    log unavailable: no log_file");
-				continue;
+			const expanded = interactive && expandedPids.has(record.pid);
+			const prefix = interactive ? `  ${expanded ? "▾" : "▸"} ` : "  ";
+			const start = lines.length;
+			lines.push(`${prefix}${alive ? "●" : "○"} PID ${record.pid}: ${label} (${formatDuration(Date.now() - record.startedAt)})${alive ? "" : " [exited]"}`);
+			if (expanded) {
+				if (!record.logFile) {
+					lines.push("    log unavailable: no log_file");
+				} else {
+					const tail = readLogTail(record.logFile, WIDGET_LOG_LINES, LOG_TAIL_BYTES);
+					if (tail === null) {
+						lines.push(`    log unavailable: ${truncateToWidth(replaceControlCharacters(stripTerminalSequences(record.logFile)), 100)}`);
+					} else if (!tail) {
+						lines.push("    log empty");
+					} else {
+						for (const line of tail.split("\n").slice(-WIDGET_LOG_LINES)) {
+							lines.push(`    ${truncateToWidth(line, 140)}`);
+						}
+					}
+				}
 			}
-			const tail = readLogTail(record.logFile, WIDGET_LOG_LINES, LOG_TAIL_BYTES);
-			if (tail === null) {
-				lines.push(`    log unavailable: ${truncateToWidth(replaceControlCharacters(stripTerminalSequences(record.logFile)), 100)}`);
-				continue;
-			}
-			if (!tail) {
-				lines.push("    log empty");
-				continue;
-			}
-			for (const line of tail.split("\n").slice(-WIDGET_LOG_LINES)) {
-				lines.push(`    ${truncateToWidth(line, 140)}`);
-			}
+			taskRows.push({ pid: record.pid, start, end: lines.length });
 		}
-		return lines;
+		return { lines, taskRows };
+	}
+
+	function togglePidExpanded(pid: number): void {
+		if (expandedPids.has(pid)) expandedPids.delete(pid);
+		else expandedPids.add(pid);
+		refreshUI();
+	}
+
+	function clearExpandedPids(): void {
+		expandedPids.clear();
 	}
 
 	function disposeWidget(): void {
@@ -381,14 +425,16 @@ export default function (pi: ExtensionAPI) {
 			uiRef.setStatus("bg-watch", undefined);
 			disposeWidget();
 			latestWidgetLines = [];
+			latestTaskRows = [];
 			uiRef.setWidget("bg-watch", undefined);
 			return;
 		}
 
 		const running = active.filter((record) => isAlive(record.pid)).length;
 		uiRef.setStatus("bg-watch", `● ${running} bg task${running > 1 ? "s" : ""} running`);
-		latestWidgetLines = buildWidgetLines(active);
 		if (!uiRef.isTui) {
+			latestWidgetLines = buildWidgetLines(active, expandedPids, false).lines;
+			latestTaskRows = [];
 			const capped = latestWidgetLines.length > MAX_WIDGET_LINES
 				? [...latestWidgetLines.slice(0, MAX_WIDGET_LINES - 1), `  … ${latestWidgetLines.length - MAX_WIDGET_LINES + 1} more lines`]
 				: latestWidgetLines;
@@ -396,26 +442,32 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const built = buildWidgetLines(active, expandedPids, true);
+		latestWidgetLines = built.lines;
+		latestTaskRows = built.taskRows;
 		if (!widgetMountRequested) {
 			widgetMountRequested = true;
 			uiRef.setWidget(
 				"bg-watch",
 				(tui, theme) => {
-					const component = new BackgroundTaskWidget(tui, theme, latestWidgetLines);
+					const component = new BackgroundTaskWidget(tui, theme, latestWidgetLines, latestTaskRows, togglePidExpanded);
 					widgetComponent = component;
 					return component;
 				},
 				{ placement: "aboveEditor" },
 			);
 		}
-		widgetComponent?.setLines(latestWidgetLines);
+		widgetComponent?.setLines(latestWidgetLines, latestTaskRows);
 	}
 
 	pi.registerShortcut(Key.ctrlShift("b"), {
 		description: "Toggle bg-watch log summary",
 		handler: () => {
-			if (listActive().length === 0) return;
-			widgetExpanded = !widgetExpanded;
+			const active = listActive();
+			if (active.length === 0) return;
+			const allExpanded = active.every((record) => expandedPids.has(record.pid));
+			if (allExpanded) expandedPids.clear();
+			else for (const record of active) expandedPids.add(record.pid);
 			refreshUI();
 		},
 	});
@@ -975,7 +1027,7 @@ export default function (pi: ExtensionAPI) {
 		activeLogPanel?.close();
 		activeLogPanel = null;
 		uiRef = null;
-		widgetExpanded = false;
+		clearExpandedPids();
 
 		// capture UI ref for widget/status updates
 		if (ctx.hasUI) {
@@ -1010,5 +1062,6 @@ export default function (pi: ExtensionAPI) {
 		activeLogPanel = null;
 		uiRef = null;
 		currentSessionId = undefined;
+		clearExpandedPids();
 	});
 }
